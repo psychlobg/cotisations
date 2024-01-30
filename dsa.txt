@@ -1,0 +1,39 @@
+https://www.powershellgallery.com/packages/DSACL/1.0.0/Content/DSACL.psm1
+
+#Region '.\Public\Add-DSACLManageGroupMember.ps1' 0
+
+#Region '.\Public\Add-DSACLJoinDomain.ps1' 0
+DSACLResetPassword
+
+https://gist.github.com/aledeniz/d9732fb8e347a21b136dceb8231b7361
+#Get the SID values of each group we wish to delegate access to
+#Get a copy of the current DACL on the OU
+$acl = Get-ACL -Path ($ou.DistinguishedName)
+    
+#Create an Access Control Entry for new permission we wish to add
+#Allow the group to write all properties of descendent user objects
+$acl.AddAccessRule((New-Object System.DirectoryServices.ActiveDirectoryAccessRule `
+$p,"GenericAll","Allow","Descendents",$guidmap["user"]))
+ 
+#Allow the group to read all properties of descendent user objects    
+$acl.AddAccessRule((New-Object System.DirectoryServices.ActiveDirectoryAccessRule `
+$p,"GenericAll","Allow","Descendents",$guidmap["group"]))
+ 
+#Allow the group to create and delete user objects in the container and all sub-containers that may get created
+$acl.AddAccessRule((New-Object System.DirectoryServices.ActiveDirectoryAccessRule `
+$p,"CreateChild,DeleteChild","Allow",$guidmap["user"],"All"))
+ 
+#Allow the group to create and delete group objects in the container and all sub-containers that may get created 
+$acl.AddAccessRule((New-Object System.DirectoryServices.ActiveDirectoryAccessRule `
+$p,"CreateChild,DeleteChild","Allow",$guidmap["group"],"All"))    
+ 
+#Re-apply the modified DACL to the OU
+Set-ACL -ACLObject $acl -Path ("AD:\"+($ou.DistinguishedName))
+
+
+https://stackoverflow.com/questions/50509801/setting-write-member-attribute-in-acl-on-active-directory-object-with-powershe
+https://learn.microsoft.com/en-us/dotnet/api/system.directoryservices.activedirectorysecurityinheritance?view=dotnet-plat-ext-8.0
+
+https://learn.microsoft.com/en-us/dotnet/api/system.directoryservices.activedirectoryrights?view=dotnet-plat-ext-8.0
+
+https://woshub.com/create-organizational-unit-structure-ad-powershell/
