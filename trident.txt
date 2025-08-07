@@ -1,0 +1,326 @@
+# Installation Air-Gapped de K3s et NetApp Trident avec tridentctl sur Debian (Protocole NFS uniquement)
+
+Ce guide détaille l'installation **air-gapped** (sans connexion Internet) de **K3s** (Kubernetes léger) et **NetApp Trident** (orchestrateur de stockage) sur un système **Debian**, en utilisant le protocole **NFS** pour tester la création de volumes persistants (PV) avec une SVM (Storage Virtual Machine) pour CSI. Il inclut également l’option d’installer uniquement **tridentctl** en copiant le binaire dans `/usr/bin`. Les étapes tiennent compte de l’absence de connexion Internet, en supposant que les fichiers nécessaires sont transférés via un support externe (par exemple, clé USB).
+
+---
+
+## Prérequis
+
+### Configuration matérielle minimale
+- **Noeud K3s** :
+- **CPU** : 2 vCPUs
+- **Mémoire** : 4 Go de RAM
+- **Stockage** : 20 Go d’espace disque (SSD recommandé)
+- **Système d’exploitation** : Debian 11 (Bullseye) ou Debian 12 (Bookworm)
+- **Accès réseau** :
+- Connectivité réseau entre le noeud K3s et la SVM NetApp (ports NFS : 111, 2049).
+- **Pas d’accès Internet** : Tous les fichiers nécessaires doivent être transférés manuellement sur la machine via un support externe.
+
+### Logiciels requis
+- **Système d’exploitation** : Debian 11 ou 12.
+- **Outils NFS** : `nfs-common` pour le support NFS.
+- **kubectl** : Pour interagir avec le cluster Kubernetes (inclus dans K3s ou téléchargé séparément).
+- **Fichiers à transférer** :
+- Binaires et images pour K3s (disponibles sur la machine connectée à Internet).
+- Paquet Trident et binaire `tridentctl`.
+- Images conteneurs pour Trident (pré-téléchargées).
+
+### Prérequis NetApp
+- **SVM configurée** sur un système ONTAP avec :
+- Une LIF (Logical Interface) de gestion (management LIF) accessible.
+- Une LIF de données (data LIF) pour NFS.
+- Un utilisateur admin avec des privilèges pour gérer la SVM.
+- Agrégats assignés à la SVM pour le provisionnement de volumes.
+- **Protocole** : NFS activé sur la SVM.
+
+---
+
+## Étape 1 : Préparation des fichiers pour l’installation air-gapped
+
+Puisque la machine cible n’a pas d’accès Internet, vous devez préparer et transférer les fichiers nécessaires depuis une machine connectée à Internet.
+
+1. **Sur une machine connectée à Internet** :
+- **Télécharger les fichiers K3s** :
+- Téléchargez le binaire K3s, les images conteneurs, et le script d’installation pour la version souhaitée (par exemple, v1.27.16+k3s2) :
+```bash
+mkdir k3s-airgap
+cd k3s-airgap
+wget https://github.com/k3s-io/k3s/releases/download/v1.27.16%2Bk3s2/k3s
+wget https://github.com/k3s-io/k3s/releases/download/v1.27.16%2Bk3s2/k3s-airgap-images-amd64.tar.gz
+wget https://get.k3s.io -O install.sh
+chmod +x k3s install.sh
+```
+- Note : Remplacez `v1.27.16+k3s2` par la version souhaitée. Vérifiez les versions sur [GitHub K3s](https://github.com/k3s-io/k3s/releases).
+- **Télécharger les fichiers Trident** :
+- Téléchargez la dernière version de Trident (par exemple, v25.06.0) :
+```bash
+wget https://github.com/NetApp/trident/releases/download/v25.06.0/trident-installer-25.06.0.tar.gz
+```
+- Extrayez le paquet pour récupérer `tridentctl` et les manifests :
+```bash
+tar -xf trident-installer-25.06.0.tar.gz
+```
+- Téléchargez les images conteneurs Trident (utilisez `docker` ou `podman` sur la machine connectée) :
+```bash
+docker pull netapp/trident:25.06.0
+docker pull netapp/trident-operator:25.06.0
+docker pull netapp/trident-autosupport:25.06.0
+docker save -o trident-images.tar netapp/trident:25.06.0 netapp/trident-operator:25.06.0 netapp/trident-autosupport:25.06.0
+```
+- **Télécharger les dépendances Debian** :
+- Installez `nfs-common` sur la machine connectée pour récupérer le paquet :
+```bash
+apt update
+apt install -y --download-only nfs-common
+```
+- Les paquets téléchargés sont stockés dans `/var/cache/apt/archives/`. Copiez-les dans un dossier :
+```bash
+mkdir deb-packages
+cp /var/cache/apt/archives/*.deb deb-packages/
+```
+
+2. **Transférer les fichiers** :
+- Copiez les fichiers suivants sur un support externe (clé USB, etc.) :
+- `k3s-airgap/k3s`
+- `k3s-airgap/k3s-airgap-images-amd64.tar.gz`
+- `k3s-airgap/install.sh`
+- `trident-installer-25.06.0.tar.gz`
+- `trident-images.tar`
+- `deb-packages/*.deb`
+- Transférez le support externe sur la machine Debian air-gapped.
+
+---
+
+## Étape 2 : Installation de K3s en mode air-gapped
+
+1. **Préparer le système Debian** :
+- Installez les dépendances NFS :
+```bash
+sudo dpkg -i deb-packages/*.deb
+sudo apt install -f -y # Résout les dépendances manquantes
+```
+- Créez les répertoires nécessaires pour K3s :
+```bash
+sudo mkdir -p /var/lib/rancher/k3s/agent/images/
+```
+
+2. **Installer K3s** :
+- Copiez les fichiers K3s dans les emplacements appropriés :
+```bash
+sudo cp k3s /usr/local/bin/k3s
+sudo chmod +x /usr/local/bin/k3s
+sudo cp k3s-airgap-images-amd64.tar.gz /var/lib/rancher/k3s/agent/images/
+```
+- Exécutez le script d’installation en mode air-gapped :
+```bash
+sudo INSTALL_K3S_SKIP_DOWNLOAD=true ./install.sh
+```
+- Cette commande installe un cluster K3s à noeud unique avec `containerd` comme runtime par défaut. Le fichier `kubeconfig` est généré à `/etc/rancher/k3s/k3s.yaml`.
+
+3. **Vérifier l’installation** :
+- Vérifiez que le noeud est prêt :
+```bash
+sudo k3s kubectl get nodes
+```
+- Résultat attendu :
+```
+NAME STATUS ROLES AGE VERSION
+<nodename> Ready control-plane,master 1m v1.27.16+k3s2
+```
+
+4. **Configurer kubectl pour un accès utilisateur** :
+- Copiez le fichier `kubeconfig` pour un accès non-root :
+```bash
+mkdir ~/.kube
+sudo cp /etc/rancher/k3s/k3s.yaml ~/.kube/config
+sudo chown $USER:$USER ~/.kube/config
+export KUBECONFIG=~/.kube/config
+```
+- Testez l’accès :
+```bash
+kubectl get nodes
+```
+
+---
+
+## Étape 3 : Installation de NetApp Trident et/ou tridentctl en mode air-gapped
+
+Vous pouvez soit installer **Trident** complet (avec les pods et CRDs), soit uniquement **tridentctl** en copiant le binaire dans `/usr/bin`.
+
+### Option 1 : Installation complète de Trident avec tridentctl
+
+1. **Préparer les fichiers Trident** :
+- Extrayez le paquet Trident :
+```bash
+tar -xf trident-installer-25.06.0.tar.gz
+cd trident-installer
+```
+- Copiez les images Trident dans le répertoire de `containerd` :
+```bash
+sudo mkdir -p /var/lib/rancher/k3s/agent/images/
+sudo cp ../trident-images.tar /var/lib/rancher/k3s/agent/images/
+```
+- Importez les images dans `containerd` :
+```bash
+sudo k3s crictl rmi --prune # Supprime les images inutilisées (facultatif)
+sudo k3s ctr images import /var/lib/rancher/k3s/agent/images/trident-images.tar
+```
+
+2. **Installer Trident avec tridentctl** :
+- Installez Trident dans le namespace `trident` :
+```bash
+./tridentctl install -n trident --image-registry none
+```
+- L’option `--image-registry none` indique que les images sont déjà chargées localement.
+- Cette commande :
+- Crée le namespace `trident`.
+- Déploie les pods Trident, les CRDs, et les sidecars CSI.
+- Copie automatiquement `tridentctl` dans `/usr/local/bin` (si disponible dans `$PATH`).
+
+3. **Vérifier l’installation** :
+- Vérifiez l’état des pods dans le namespace `trident` :
+```bash
+kubectl get pods -n trident
+```
+- Résultat attendu :
+```
+NAME READY STATUS RESTARTS AGE
+trident-controller-<hash> 6/6 Running 0 5m
+trident-node-linux-<nodename> 2/2 Running 0 5m
+```
+- Vérifiez la version de Trident :
+```bash
+./tridentctl -n trident version
+```
+Résultat attendu :
+```
++----------------+----------------+
+| SERVER VERSION | CLIENT VERSION |
++----------------+----------------+
+| 25.06.0 | 25.06.0 |
++----------------+----------------+
+```
+
+### Option 2 : Installation uniquement de tridentctl
+
+Si vous souhaitez uniquement installer **tridentctl** sans déployer Trident, vous pouvez copier le binaire dans `/usr/bin`.
+
+1. **Extraire et copier tridentctl** :
+- Extrayez le paquet Trident :
+```bash
+tar -xf trident-installer-25.06.0.tar.gz
+cd trident-installer
+```
+- Copiez le binaire `tridentctl` :
+```bash
+sudo cp tridentctl /usr/bin/tridentctl
+sudo chmod +x /usr/bin/tridentctl
+```
+- Vérifiez que `tridentctl` est accessible :
+```bash
+tridentctl version --client
+```
+Résultat attendu :
+```
++----------------+
+| CLIENT VERSION |
++----------------+
+| 25.06.0 |
++----------------+
+```
+
+**Note** : Avec `tridentctl` seul, vous ne pouvez pas gérer les backends ou volumes localement à moins qu’un cluster Trident ne soit déjà déployé (localement ou sur un cluster distant accessible via `kubeconfig`).
+
+---
+
+## Étape 4 : Configuration de la SVM pour Trident (NFS)
+
+Pour permettre à Trident de provisionner des volumes NFS sur la SVM, configurez un **backend** et une **StorageClass**.
+
+1. **Créer un fichier de configuration backend** :
+- Créez un fichier `backend.yaml` pour NFS :
+```yaml
+version: 1
+storageDriverName: ontap-nas
+backendName: ontap-nfs-backend
+managementLIF: <SVM_MANAGEMENT_IP>
+dataLIF: <SVM_DATA_IP>
+svm: <SVM_NAME>
+username: <SVM_ADMIN_USERNAME>
+password: <SVM_ADMIN_PASSWORD>
+```
+- Remplacez `<SVM_MANAGEMENT_IP>`, `<SVM_DATA_IP>`, `<SVM_NAME>`, `<SVM_ADMIN_USERNAME>`, et `<SVM_ADMIN_PASSWORD>` par les valeurs appropriées de votre SVM.
+- Transférez ce fichier sur la machine air-gapped.
+
+2. **Ajouter le backend à Trident** :
+- Appliquez la configuration (nécessite Trident installé) :
+```bash
+tridentctl -n trident create backend -f backend.yaml
+```
+- Vérifiez que le backend est créé :
+```bash
+tridentctl -n trident get backend
+```
+Résultat attendu :
+```
++---------------------+---------------+--------------------------------------+--------+---------+
+| NAME | STORAGE DRIVER| UUID | STATE | VOLUMES |
++---------------------+---------------+--------------------------------------+--------+---------+
+| ontap-nfs-backend | ontap-nas | <backend-uuid> | online | 0 |
++---------------------+---------------+--------------------------------------+--------+---------+
+```
+
+3. **Créer une StorageClass** :
+- Créez un fichier `storageclass.yaml` :
+```yaml
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+name: ontap-nfs
+provisioner: csi.trident.netapp.io
+parameters:
+backendType: "ontap-nas"
+allowVolumeExpansion: true
+```
+- Transférez ce fichier sur la machine air-gapped.
+- Appliquez la StorageClass :
+```bash
+kubectl apply -f storageclass.yaml
+```
+- Vérifiez la StorageClass :
+```bash
+kubectl get storageclass
+```
+Résultat attendu :
+```
+NAME PROVISIONER RECLAIMPOLICY VOLUMEBINDINGMODE ALLOWVOLUMEEXPANSION
+ontap-nfs csi.trident.netapp.io Delete Immediate true
+```
+
+---
+
+## Étape 5 : Tester la création d’un PV
+
+1. **Créer un PersistentVolumeClaim (PVC)** :
+- Créez un fichier `pvc.yaml` :
+```yaml
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+name: test-pvc
+spec:
+accessModes:
+- ReadWriteMany
+resources:
+requests:
+storage: 5Gi
+storageClassName: ontap-nfs
+```
+- Transférez ce fichier sur la machine air-gapped.
+- Appliquez le PVC :
+```bash
+kubectl apply -f pvc.yaml
+```
+
+2. **Vérifier le PVC et le PV** :
+- Vérifiez l
