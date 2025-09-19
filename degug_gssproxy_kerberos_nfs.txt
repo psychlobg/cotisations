@@ -1,0 +1,212 @@
+# Configuring and Debugging Kerberos with NFS Mounts using gssproxy on Debian Trixie
+
+This guide details how to configure `gssproxy`, `nfs-utils`, and `rpc.gssd` to mount NFS shares with Kerberos authentication on Debian Trixie, using the Linux keyring for credential caches. It also includes a comprehensive debugging procedure to verify `gssproxy` usage.
+
+## Prerequisites
+- **Kerberos Setup**: A working Kerberos configuration (e.g., via `krb5-user` package) with tickets obtainable via `kinit`.
+- **NFS Server**: NFS shares exported with Kerberos support (e.g., `sec=krb5` in `/etc/exports` on the server).
+- **NFS Version**: Use NFSv4 for optimal Kerberos integration (`-t nfs4` for mounts).
+- **Packages**: Install required packages:
+  ```bash
+  sudo apt update
+  sudo apt install krb5-user nfs-common gssproxy
+
+sudo apt update
+sudo apt install krb5-user nfs-common gssproxy
+
+Step 1: Configure Kerberos for Keyring Credential Cache
+Edit /etc/krb5.conf to use the Linux keyring for persistent per-user credential caches (this stores tickets securely in the kernel keyring, avoiding files in /tmp).
+text
+
+[libdefaults]
+    default_ccache_name = KEYRING:persistent:%{uid}
+    # Add other defaults as needed, e.g., default_realm = EXAMPLE.COM
+
+Step 2: Configure gssproxy for NFS Client with Keyring Support
+gssproxy acts as a proxy for GSSAPI calls, allowing rpc.gssd to impersonate users and access their keyring-based tickets securely.
+
+Create or edit a client-specific config file in /etc/gssproxy/conf.d/ (e.g., 40-nfs-client.conf):
+text
+[service/nfs-client]
+mechs = krb5
+cred_store = ccache:KEYRING:persistent:%U
+impersonate = yes
+allow_any_uid = yes
+trusted = yes
+euid = 0
+
+cred_store: Points to the keyring ccache using the user's UID (%U expands to the numeric UID during impersonation).
+impersonate = yes: Allows gssproxy to switch to the calling user's context (e.g., for NFS upcalls from kernel with specific UID).
+This setup ensures gssproxy can read user tickets from the keyring without file-based caches, avoiding conflicts.
+
+restart gssproxy
+sudo systemctl restart gssproxy
+sudo systemctl enable gssproxy  # For boot persistence
+
+Step 3: Configure nfs-utils and rpc.gssd
+nfs-utils (via nfs-common package) includes rpc.gssd, which handles GSS context creation for NFS.
+
+Edit /etc/nfs.conf (or /etc/default/nfs-common for legacy options) to enable gssproxy integration:
+[gssd]
+use-gss-proxy = 1
+# Optional: Restrict to your realm or add verbosity for debugging
+preferred_realm = YOUR.REALM
+verbosity = 1  # Increase to 2+ for more logs in /var/log/syslog
+
+Ensure rpc.gssd starts automatically (it's enabled by default in nfs-common, but confirm):
+sudo systemctl enable rpc-gssd
+sudo systemctl restart rpc-gssd
+
+For debugging, check logs:
+sudo journalctl -u rpc-gssd -f
+sudo journalctl -u gssproxy -f
+
+Step 4: Mount the NFS Share
+
+Obtain a Kerberos ticket if not already (e.g., kinit).
+Mount with Kerberos security (replace server.example.com:/export and /mnt/point):
+sudo mkdir /mnt/point
+sudo mount -t nfs4 -o sec=krb5 server.example.com:/export /mnt/point
+
+Use sec=krb5i for integrity or sec=krb5p for privacy (encryption).
+Add to /etc/fstab for persistence:
+
+server.example.com:/export /mnt/point nfs4 sec=krb5 0 0
+
+Troubleshooting
+
+No tickets in keyring: Run klist after kinit; ensure pam_krb5 is configured if using PAM logins.
+Mount fails with "No credentials cache found": Verify keyring config in krb5.conf and gssproxy's cred_store. Test without gssproxy (use-gss-proxy=0) to isolate.
+Permission denied: Ensure NFS server exports match your principal (e.g., nfs/server.example.com@YOUR.REALM in keytab). Check showmount -e server and server logs.
+Daemon access (non-interactive): For services/daemons, create per-user keytabs and add cred_store = client_keytab:/var/lib/gssproxy/clients/%U.keytab to gssproxy config.
+Trixie-specific: These steps align with trixie manpages (e.g., rpc.gssd 1.3.4+); if issues, check apt show nfs-common gssproxy for versions.
+
+This setup provides secure, user-impersonated Kerberos NFS access using keyring caches. Test access as a non-root user after mounting.
+
+To debug and verify that gssproxy is being used for Kerberos authentication with NFS mounts on Debian Trixie, you can follow these steps. These focus on checking gssproxy operation, its interaction with rpc.gssd, and confirming it accesses the keyring-based credential cache.
+1. Enable Verbose Logging for gssproxy
+Increase gssproxy verbosity to capture detailed logs:
+
+Edit /etc/gssproxy/gssproxy.conf (or the specific config in /etc/gssproxy/conf.d/, e.g., 40-nfs-client.conf).
+Add or modify the [gssproxy] section to include:
+
+[gssproxy]
+debug_level = 2  # 0=errors only, 1=basic, 2=verbose, 3=very verbose
+sudo systemctl restart gssproxy
+sudo journalctl -u gssproxy -f
+
+Look for messages indicating:
+
+gssproxy starting and loading the nfs-client service.
+Credential cache access (KEYRING:persistent:<uid>).
+Impersonation requests from rpc.gssd (e.g., Impersonating UID:<uid>).
+2. Enable Verbose Logging for rpc.gssd
+Ensure rpc.gssd is communicating with gssproxy:
+
+Edit /etc/nfs.conf (or /etc/default/nfs-common for legacy setups):
+[gssd]
+use-gss-proxy = 1
+verbosity = 2  # Increase for more details
+sudo systemctl restart rpc-gssd
+sudo journalctl -u rpc-gssd -f
+
+Look for:
+
+Confirmation that rpc.gssd is using gssproxy (e.g., using gssproxy or similar).
+No errors about missing credential caches or failed GSSAPI calls.
+Successful context creation for nfs/<server>@<REALM>.
+
+3. Verify gssproxy Process and Socket
+Check if gssproxy is running and listening for requests:
+
+Confirm the service is active:
+sudo systemctl status gssproxy
+Check for the gssproxy socket, which rpc.gssd uses:
+ls -l /var/lib/gssproxy/
+
+You should see default.sock or clients/ directory with sockets. If not, gssproxy isn’t properly initialized.
+Use netstat or ss to verify the socket is active:
+sudo ss -l | grep gssproxy
+Look for a UNIX socket like /var/lib/gssproxy/default.sock.
+
+4. Test Keyring Credential Cache Access
+Ensure gssproxy is accessing the keyring-based credentials:
+
+Obtain a Kerberos ticket as a test user:
+kinit youruser@YOUR.REALM
+klist
+Confirm the ticket is in the keyring (e.g., Ticket cache: KEYRING:persistent:<uid>:<uid>).
+
+Check if gssproxy logs show it accessing the keyring for your UID when an NFS operation occurs:
+sudo journalctl -u gssproxy | grep KEYRING
+Look for lines indicating ccache:KEYRING:persistent:<uid>.
+
+5. Test NFS Mount with Debugging
+Mount the NFS share with verbose output to catch issues:
+
+Unmount any existing share:
+sudo umount /mnt/point
+
+Remount with Kerberos security and verbose logging:
+sudo mount -t nfs4 -o sec=krb5,verbose server.example.com:/export /mnt/point
+
+Check kernel logs for NFS-related messages:
+sudo dmesg | tail -n 50
+
+Look for:
+
+GSS context negotiation details.
+Errors like "No credentials found" or "GSSAPI failure," which indicate gssproxy misconfiguration.
+
+
+Access the mount as the user (e.g., ls /mnt/point) and check gssproxy and rpc.gssd logs for activity.
+
+6. Use strace to Trace gssproxy and rpc.gssd
+For deeper debugging, trace system calls to confirm interactions:
+
+Attach strace to gssproxy:
+sudo strace -p $(pidof gssproxy) -o gssproxy_trace.log
+
+Attach strace to rpc.gssd:
+sudo strace -p $(pidof rpc.gssd) -o rpcgssd_trace.log
+
+Perform an NFS operation (e.g., ls /mnt/point as the user).
+Check trace logs for:
+
+gssproxy: Calls to keyctl (indicating keyring access) and socket communication with rpc.gssd.
+rpc.gssd: Connections to /var/lib/gssproxy/default.sock and absence of direct /tmp/krb5cc_* file access (confirming gssproxy usage).
+
+7. Check gssproxy Configuration
+Verify the gssproxy config is correctly set for NFS:
+
+Ensure /etc/gssproxy/conf.d/40-nfs-client.conf contains:
+[service/nfs-client]
+mechs = krb5
+cred_store = ccache:KEYRING:persistent:%U
+impersonate = yes
+allow_any_uid = yes
+trusted = yes
+euid = 0
+
+Expected Indicators of gssproxy Usage
+
+Logs show gssproxy handling NFS requests and accessing KEYRING:persistent:<uid>.
+rpc.gssd logs mention use-gss-proxy and no direct credential file access.
+No errors in journalctl about missing credentials or GSSAPI failures.
+strace shows gssproxy interacting with keyring and rpc.gssd using the proxy socket.
+
+If gssproxy Isn’t Used
+If logs or strace show rpc.gssd bypassing gssproxy:
+
+Confirm use-gss-proxy = 1 in /etc/nfs.conf.
+Check if /var/lib/gssproxy/default.sock exists.
+Disable gssproxy temporarily (use-gss-proxy = 0) to compare behavior, but re-enable for keyring support.
+Ensure gssproxy version (check with apt show gssproxy) is compatible (Trixie’s 0.9.x or later works well).
+
+Final Notes
+
+Always test as the user who owns the Kerberos ticket (not root), as gssproxy impersonates based on UID.
+If issues persist, cross-check with man gssproxy and man rpc.gssd (Trixie versions) for additional options.
+For complex setups, consider joining the gssproxy-users mailing list or checking Debian’s bug tracker for Trixie-specific issues.
+
+This should confirm whether gssproxy is correctly handling Kerberos for NFS mounts. Let me know if you hit specific errors!

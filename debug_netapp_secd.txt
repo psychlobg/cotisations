@@ -1,0 +1,24 @@
+Enable Kerberos Tracing During Mount:
+
+To trace Kerberos library calls (useful for debugging AS-REQ/TGS-REQ failures), set the KRB5_TRACE environment variable and mount verbosely:
+
+export KRB5_TRACE=/dev/stderr
+mount -v -o sec=krb5 <svm-ip-or-fqdn>:/<volume-or-path> /mnt/point
+
+This outputs detailed Kerberos negotiation steps to stderr, including enctype negotiations and errors like "KRB5KDC_ERR_ETYPE_NOSUPP" (unsupported encryption) or "KRB_AP_ERR_SKEW" (time skew).
+Alternatively, log to a file:
+export KRB5_TRACE=/tmp/krb5-trace.log
+mount -v -o sec=krb5 <svm-ip-or-fqdn>:/<volume-or-path> /mnt/point
+Then review the log with cat /tmp/krb5-trace.log.
+
+system node run -node <node-name>
+tail -f /etc/log/secd
+tail -f /mroot/etc/mlog/secd.log.
+
+For more detailed debugging, enable a SECD trace before tailing (diag privilege required):
+
+diag secd trace set -node <node-name> -vserverids <svm-name> -trace-all yes
+Reproduce the issue, then view enhanced logs via tail.
+Clear after: diag secd trace clear -node <node-name> -trace-all yes (and other params as needed).
+
+Always return to admin privilege: set -privilege admin. Use these only during debugging to avoid performance impact.
