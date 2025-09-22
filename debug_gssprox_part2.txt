@@ -1,0 +1,262 @@
+Quick Prerequisites Check
+Before diving in:
+
+Confirm your ticket: Run klist as the logged-in user. You should see your TGT (Ticket-Granting Ticket) with a valid expiration.
+Ensure gssproxy is installed and running: apt install gssproxy (if not already), then systemctl status gssproxy. It should be active.
+Your Kerberos config (/etc/krb5.conf) should point to the right KDC/realm.
+The user's ccache is usually at /tmp/krb5cc_<UID> (e.g., /tmp/krb5cc_1000), owned by the user.
+
+If those are good, proceed.
+
+Common Causes for gssproxy Not Accessing User Tickets
+
+Credential Store Misconfig: gssproxy defaults to no cred_store, so it won't look for user ccaches. You need to explicitly tell it to use the default user ccache (via ccache:).
+Socket Permissions: The gssproxy socket (/var/lib/gssproxy/gssproxy.sock) must be accessible by processes needing credentials. Default is often root-owned with restrictive perms, blocking unprivileged user processes.
+No Matching Service Section: gssproxy matches requests by effective UID (euid). Without a section allowing "any" or your service's UID, it fails silently.
+Impersonation/Delegation Not Enabled: If the process isn't running as the user, you may need impersonate = true for S4U2Self.
+Cache Overwrite or SELinux/AppArmor: gssproxy might overwrite ccaches or be blocked by security policies (Debian uses AppArmor by default—check /var/log/syslog for denials).
+
+Sample Config for Using Current User's Kerberos Ticket
+The default /etc/gssproxy/gssproxy.conf on Debian 12 is minimal (often just a placeholder), so you'll likely need to add/edit it. Here's a basic example for proxying user tickets to any service (e.g., for NFS client or general use). This sets up a catch-all section for root/any UID, uses the default user ccache, and enables basic impersonation.
+Backup your config first: cp /etc/gssproxy/gssproxy.conf /etc/gssproxy/gssproxy.conf.bak
+Then edit /etc/gssproxy/gssproxy.conf (or create a drop-in like /etc/gssproxy/conf.d/10-user-tickets.conf):
+
+[gssproxy]
+# Global settings
+debug = true
+debug_level = 2  # 0=off, 1=basic, 2=verbose (includes KRB5 traces)
+syslog_status = true  # Log per-call details
+run_as_user = root  # Or gssproxy if you want to drop privs
+
+# Catch-all service for user tickets (matches any euid, uses user's default ccache)
+[service/root]
+euid = root
+mechs = krb5  # Kerberos mechanism
+cred_store = ccache:  # Use default ccache for the connecting process's euid (e.g., /tmp/krb5cc_%U)
+cred_usage = both  # Allow initiate/accept
+allow_any_uid = true  # Allow any calling process UID
+impersonate = true  # Enable S4U2Self for non-user processes to impersonate the ticket owner
+allow_protocol_transition = true  # Allow arbitrary user tickets (if your KDC supports it)
+filter_flags = -DELEGATE  # Allow delegation if needed (remove - if not)
+
+# Optional: For a specific service like NFS (add if using NFSv4 with Kerberos)
+[service/nfs]
+euid = root
+mechs = krb5
+cred_store = ccache:
+cred_usage = initiate
+allow_any_uid = true
+
+Key Explanations:
+
+cred_store = ccache:: This is crucial—it tells gssproxy to use the default Kerberos ccache for the effective UID of the process connecting to the socket (e.g., your logged-in user's /tmp/krb5cc_<UID>).
+allow_any_uid = true: Lets non-root processes (like user apps) use it. Place this section last to avoid overriding specific ones.
+impersonate = true: If the calling process (e.g., a daemon) isn't the user, this proxies the user's ticket via Kerberos extensions.
+For NFS-specific: Add cred_usage = initiate and ensure rpc_pipefs is mounted (mount -t rpc_pipefs none /var/lib/nfs/rpc_pipefs).
+
+Debugging Steps
+Follow these in order to pinpoint the issue. Run as the logged-in user unless noted.
+
+Enable/Confirm Logging:
+
+Add debug = true and debug_level = 2 to [gssproxy] (as in the sample), restart, then trigger your use case (e.g., attempt an NFS mount or whatever app uses gssproxy).
+Check logs: journalctl -u gssproxy -f (live tail) or grep gssproxy /var/log/syslog.
+Look for errors like "no valid credentials found", "ccache not accessible", or KRB5 traces showing failed acquires.
+AppArmor denials? aa-status and grep DENIED /var/log/syslog | grep gssproxy.
+
+Debugging Steps
+Follow these in order to pinpoint the issue. Run as the logged-in user unless noted.
+
+Enable/Confirm Logging:
+
+Add debug = true and debug_level = 2 to [gssproxy] (as in the sample), restart, then trigger your use case (e.g., attempt an NFS mount or whatever app uses gssproxy).
+Check logs: journalctl -u gssproxy -f (live tail) or grep gssproxy /var/log/syslog.
+Look for errors like "no valid credentials found", "ccache not accessible", or KRB5 traces showing failed acquires.
+AppArmor denials? aa-status and grep DENIED /var/log/syslog | grep gssproxy.
+
+
+Test gssproxy Directly:
+
+Use the built-in test tool: gssproxy --test (or gss_client if installed via apt install gssproxy-tools).
+Simulate a cred acquire: As the user, run kinit to refresh your ticket, then gssproxy -d -c /etc/gssproxy/gssproxy.conf (debug mode; Ctrl+C to stop).
+Test with curl (if HTTP/Kerberos): curl --negotiate -u : http://your-kerb-protected-server/ and watch gssproxy logs.
+
+
+Verify Ccache Access:
+
+As root: ls -la /tmp/krb5cc_*—ensure gssproxy (root) can read the user's ccache (it should, as /tmp is world-readable, but ownership matters).
+Run klist -c /tmp/krb5cc_<your-UID> as root to confirm readability.
+If gssproxy overwrites the cache (common bug), set KRB5CCNAME=/tmp/krb5cc_<UID> in your env and test.
+
+
+Strace for Low-Level Debug:
+
+Trigger your app (e.g., mount -t nfs4 ...), then strace -e trace=connect,openat -p <pid-of-app-or-gssproxy> to see if it's connecting to the socket and opening the ccache.
+Or attach to gssproxy: strace -f -p $(pgrep gssproxy).
+
+
+Service-Specific Checks:
+
+For NFS: showmount -e server or mount.nfs4 server:/export /mnt -o sec=krb5 and check dmesg | grep gss.
+For SSH/Apache: Ensure mod_auth_gssapi is configured to use gssproxy socket.
+If using SSSD/FreeIPA: sss_cache -E to invalidate caches, then re-kinit.
+
+
+Advanced: KRB5_TRACE:
+
+Set export KRB5_TRACE=/dev/stderr before running your app/gssproxy test. This dumps full Kerberos debug (noisy but detailed).
+
+If you're using a keyring-based Kerberos credential cache (ccache) instead of the default file-based one (e.g., /tmp/krb5cc_<UID>), gssproxy needs specific configuration to access it, as keyring caches are stored in the kernel keyring (in memory, not on disk) and tied to the user's session. This can complicate things because gssproxy, running as root or a service user, may not directly see the user's keyring cache without proper setup. Below, I'll explain how to configure gssproxy to work with a keyring-based Kerberos ticket, potential issues, and how to debug it on Debian 12.
+Key Considerations for Keyring-Based Caches
+
+Keyring Cache Basics: When you use KRB5CCNAME=KEYRING:<name> (or a variant like KEYRING:persistent:<UID>:<name>), your Kerberos tickets are stored in the kernel's keyring (viewable with keyctl show). This is common in environments using SSSD, FreeIPA, or modern desktop setups for better security (no disk writes).
+
+
+
+If you share your config file, logs from a failed attempt (e.g., after enabling debug), or the exact command/app that's failing (e.g., "NFS mount errors with 'no credentials'"), I can refine this further. What's the specific service/use case (NFS, HTTP, etc.)? Let's get this sorted!
+
+gssproxy Challenge: gssproxy typically expects a file-based ccache unless explicitly configured to use a keyring. Without the right cred_store setting, it won't find the ticket.
+Access Control: The keyring is tied to the user's UID and session. gssproxy, running as root or gssproxy user, needs to impersonate or access the correct keyring namespace.
+Environment Variables: The KRB5CCNAME env var must be set correctly for both the user and the process gssproxy serves (e.g., NFS client, Apache).
+
+Steps to Configure gssproxy for Keyring Cache
+
+
+Confirm Keyring Cache Usage:
+
+Run klist as the logged-in user to verify your ticket exists.
+Check KRB5CCNAME: echo $KRB5CCNAME. It should look like KEYRING:persistent:<UID>:<name> (e.g., KEYRING:persistent:1000:myticket) or just KEYRING:<name>.
+View the keyring: keyctl show (install keyutils if needed: apt install keyutils). Look for a key type user or keyring with your ticket name.
+
+
+
+Update gssproxy Config:
+Modify /etc/gssproxy/gssproxy.conf (or a drop-in in /etc/gssproxy/conf.d/) to point to the keyring cache. Here's an updated config example tailored for keyring:
+
+Steps to Configure gssproxy for Keyring Cache
+
+
+Confirm Keyring Cache Usage:
+
+Run klist as the logged-in user to verify your ticket exists.
+Check KRB5CCNAME: echo $KRB5CCNAME. It should look like KEYRING:persistent:<UID>:<name> (e.g., KEYRING:persistent:1000:myticket) or just KEYRING:<name>.
+View the keyring: keyctl show (install keyutils if needed: apt install keyutils). Look for a key type user or keyring with your ticket name.
+
+
+
+Update gssproxy Config:
+Modify /etc/gssproxy/gssproxy.conf (or a drop-in in /etc/gssproxy/conf.d/) to point to the keyring cache. Here's an updated config example tailored for keyring:
+
+
+[gssproxy]
+debug = true
+debug_level = 2  # Verbose logging for debugging
+syslog_status = true
+run_as_user = root  # Or gssproxy user if preferred
+
+[service/user-keyring]
+euid = <your-user-UID>  # Replace with your UID (e.g., 1000); or use allow_any_uid
+mechs = krb5
+cred_store = keyring:persistent:%U  # %U is replaced by the effective UID's keyring
+cred_usage = both  # Initiate/accept as needed
+allow_any_uid = true  # Set to false if restricting to specific UID
+impersonate = true  # For daemons impersonating the user
+allow_protocol_transition = true  # For S4U2Proxy if needed
+
+Key Notes:
+
+cred_store = keyring:persistent:%U: This tells gssproxy to look in the persistent keyring for the user's UID (e.g., KEYRING:persistent:1000). %U dynamically substitutes the effective UID.
+If your KRB5CCNAME is KEYRING:<specific-name>, use cred_store = keyring:<specific-name> instead.
+allow_any_uid = true: Allows gssproxy to serve any user's keyring (useful for multi-user systems). For single-user, set euid = <your-UID> for specificity.
+
+
+Save and validate: gssproxy -c /etc/gssproxy/gssproxy.conf --test-config (if available).
+
+Restart gssproxy: systemctl restart gssproxy.
+
+
+
+Set KRB5CCNAME for the Environment:
+
+Ensure the process using gssproxy (e.g., NFS client, curl) has KRB5CCNAME set. For example, as the user:
+
+export KRB5CCNAME=KEYRING:persistent:<your-UID>
+
+If the process is a daemon (e.g., rpc.gssd for NFS), set it in the service environment:
+
+echo "KRB5CCNAME=KEYRING:persistent:%U" > /etc/systemd/system/gssproxy.service.d/env.conf
+systemctl daemon-reload
+systemctl restart gssproxy
+
+For NFS specifically, ensure rpc.gssd is configured to use gssproxy (check /etc/sysconfig/nfs or /etc/nfs.conf for use-gss-proxy=1).
+
+Fix Socket Permissions:
+
+The gssproxy socket (/var/lib/gssproxy/gssproxy.sock) must be accessible:
+chmod 777 /var/lib/gssproxy/gssproxy.sock  # Temporary for testing
+
+For production, add your user or service group to the socket: chgrp <group> /var/lib/gssproxy/gssproxy.sock; chmod g+rw /var/lib/gssproxy/gssproxy.sock.
+
+Debugging Keyring-Specific Issues
+If gssproxy still can't access the keyring-based ticket, follow these steps:
+
+Check Logs:
+
+Enable verbose logging (as above) and check: journalctl -u gssproxy -f.
+Look for errors like "failed to find credentials in keyring" or "keyring access denied".
+AppArmor issues? grep DENIED /var/log/syslog | grep gssproxy. If blocked, allow keyring access:
+
+aa-complain /usr/sbin/gssproxy  # Temporary; create a proper profile for production
+
+Verify Keyring Access:
+
+As root, test keyring visibility: keyctl show @u (user keyring) or keyctl show @s (session keyring).
+If the ticket isn't visible, ensure the user ran kinit in the correct session and KRB5CCNAME matches the keyring name.
+Test with klist -c KEYRING:persistent:<your-UID> to confirm the ticket is in the keyring.
+
+
+Test gssproxy with Keyring:
+
+Run gssproxy -d -c /etc/gssproxy/gssproxy.conf in debug mode and trigger your app (e.g., mount -t nfs4 server:/export /mnt -o sec=krb5).
+Or use gss_client (from gssproxy-tools): gss_client -m krb5 -u <principal> -p <service-principal> <host>.
+Watch logs for keyring-specific errors.
+
+Check Environment Propagation:
+
+If the app/daemon doesn't see KRB5CCNAME, set it globally: Add to /etc/environment or the user's shell profile (~/.bashrc).
+For systemd services, verify with systemctl show <service> -p Environment.
+
+
+Kerberos Debug:
+
+Run export KRB5_TRACE=/dev/stderr and retry your app to see if gssproxy is trying to access the keyring correctly.
+
+
+NFS-Specific Notes:
+
+Ensure rpc.gssd uses gssproxy: Edit /etc/nfs.conf or /etc/sysconfig/nfs with use-gss-proxy=1.
+Check rpc.gssd logs: journalctl -u rpc.gssd.
+Mount with verbose output: moun
+Mount with verbose output: mount -v -t nfs4 -o sec=krb5 server:/export /mnt.
+
+otential Pitfalls
+
+Keyring Type Mismatch: If KRB5CCNAME uses KEYRING:session:<name> (session-specific), gssproxy may fail if the session keyring isn't accessible to root. Use persistent keyrings for consistency.
+SSSD Integration: If using SSSD (common with FreeIPA), ensure sssd-kcm is running (systemctl status sssd-kcm) and KRB5CCNAME=KEYRING:persistent:%U. SSSD may override ccache settings.
+Kernel Keyring Limits: Some kernels limit keyring sizes. Check dmesg | grep keyring for quota errors and increase if needed (sysctl kernel.keys.maxkeys).
+
+If you share your /etc/gssproxy/gssproxy.conf, KRB5CCNAME value, logs from journalctl -u gssproxy, and the specific app (e.g., NFS, curl), I can pinpoint the issue further. What's the exact error or behavior you're seeing?
+
+
+mkdir /partage
+chgrp developpeurs /partage
+chmod g+s /partage
+
+ls -ld /partage
+Vous devriez voir quelque chose comme : drwxrwsr-x (le s indique le bit SGID).
+
+Lorsqu’un utilisateur crée un fichier dans /partage, ce fichier héritera du GID du groupe developpeurs, même si l’utilisateur a un GID primaire différent.
+
+Le bit SGID n’a pas d’effet sur les systèmes de fichiers qui ne le prennent pas en charge (par exemple, certains systèmes de fichiers non-Unix comme FAT32 ou NTFS).
+
+Via ONTAP CLI (limité) : Vous ne pouvez pas set le SGID directement via CLI sur un dossier spécifique sans monter, mais pour les permissions de base du qtree : volume qtree modify -vserver <svm> -qtree-path /vol/<vol>/<qtree> -unix-permissions 2775. Cela set les permissions du qtree lui-même (qui apparaît comme un dossier), activant potentiellement le SGID si le 2 est inclus
