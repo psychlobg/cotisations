@@ -1,0 +1,29 @@
+Oui, c’est exactement ça.
+Le module netapp.ontap.na_ontap_user_role (ou le module « role » que tu utilises) est ancien et orienté ZAPI / command-directory. Il ne gère pas bien (voire pas du tout) les rôles REST modernes avec le paramètre owner (SVM-scoped).
+Solution recommandée
+Utilise le module netapp.ontap.na_ontap_restit pour appeler directement l’API REST /api/security/roles.
+Exemple de tâche Ansible
+YAML- name: Créer le rôle SVM-scoped pour Trident
+  netapp.ontap.na_ontap_restit:
+    hostname: "{{ netapp_hostname }}"
+    username: "{{ netapp_username }}"   # ton compte cluster-scoped custom
+    password: "{{ netapp_password }}"
+    https: true
+    validate_certs: false
+    api: "/api/security/roles"
+    method: POST
+    body:
+      name: "trident_role"
+      owner:
+        name: "{{ svm_name }}"          # ou uuid si tu l'as
+      privileges:
+        - path: "/api"
+          access: "all"
+        # ou liste plus fine selon les besoins Trident
+    use_rest: always
+  register: role_result
+Points importants
+
+Ton compte d’automatisation doit avoir /api/security/roles et /api/security/roles/* en all.
+Pour un rôle SVM-scoped, le champ owner.name (ou owner.uuid) est obligatoire dans le body.
+Tu peux ensuite créer l’utilisateur et lui assigner ce rôle avec le même module ou via /api/security/accounts.
