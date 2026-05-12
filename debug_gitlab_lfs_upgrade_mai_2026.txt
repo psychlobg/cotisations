@@ -1,0 +1,120 @@
+sudo gitlab-rake gitlab:git:checksum_projects
+Exécuter un "Housekeeping" forcé
+L'erreur "vider les références" peut être liée à un fichier packed-refs corrompu ou trop volumineux que Gitaly ne parvient pas à parser.
+    Allez dans l'interface d'administration de GitLab.
+    Cherchez le projet qui pose problème.
+    Allez dans Settings > General > Advanced.
+    Cliquez sur Run housekeeping.
+    
+sudo gitlab-rake gitlab:cleanup:repos_with_missing_projects
+
+# Log principal de l'application
+sudo gitlab-ctl tail gitlab-rails/production.log
+
+# Log du service de stockage (souvent là que se trouve l'erreur 500)
+sudo gitlab-ctl tail gitaly/current
+
+## deadline exceeded, failed to enumerate refs ou permission denied.
+
+Cependant, comme le projet utilise LFS (Large File Storage), l'erreur 500 lors du clone est souvent liée à un lien rompu entre l'objet LFS en base de données et le fichier réel sur le disque (souvent stocké dans /var/opt/gitlab/gitlab-lfs-objects).
+
+sudo gitlab-rake gitlab:lfs:check
+Si la commande renvoie des erreurs : Elle vous donnera les IDs des objets manquants.
+
+Si elle ne voit rien : Le problème peut venir des permissions IAM de votre bucket S3 qui empêchent GitLab de lire les objets pendant le clone.
+
+git lfs fetch --all
+git lfs push --all origin
+
+gitlab_rails['lfs_enabled'] = true
+gitlab_rails['lfs_object_store_enabled'] = true
+gitlab_rails['lfs_object_store_connection'] = {
+  'provider' => 'AWS',
+  'region' => 'votre-region',
+  'aws_access_key_id' => 'CLE_ID',
+  'aws_secret_access_key' => 'CLE_SECRETE',
+  # Si vous utilisez un compatible S3 (Minio/Scaleway), ajoutez :
+  # 'endpoint' => 'https://votre-endpoint.com',
+  # 'path_style' => true
+}
+
+GIT_LFS_SKIP_SMUDGE=1 git clone <url_du_projet>
+
+**Avant de migrer en 18.11.2, tentez ceci :**
+Videz le cache de GitLab, cela résout parfois les erreurs 500 de références après un upgrade :
+```bash
+sudo gitlab-rake cache:clear
+
+1. Tester la connectivité S3 depuis la console GitLab
+sudo gitlab-rails console
+# Charger la configuration LFS
+connection = ::Fog::Storage.new(Gitlab.config.lfs.object_store.connection)
+
+# Tester la récupération des buckets (vérifie les credentials)
+connection.directories
+
+# Vérifier si GitLab "voit" le bucket spécifique
+bucket = connection.directories.get(Gitlab.config.lfs.object_store.remote_directory)
+
+# Lister les 5 premiers fichiers LFS
+bucket.files.first(5).each { |f| puts f.key }
+
+Si ça échoue ici : Vos credentials S3 ou l'URL de l'endpoint dans gitlab.rb sont incorrects.
+
+Si ça réussit : La connexion est bonne, le problème est au niveau de l'indexation dans la base de données GitLab.
+
+Voir 3 logs exception production et workhorse
+A. Le log d'exception (Le plus bavard sur la cause
+sudo tail -f /var/log/gitlab/gitlab-rails/exceptions.log
+sudo tail -f /var/log/gitlab/gitlab-rails/production.log
+sudo tail -f /var/log/gitlab/gitlab-workhorse/current
+
+C. Le log Workhorse
+Production Pour voir l'ID de corrélation de l'erreur 500 :
+C'est lui qui gère le transfert des gros fichiers (LFS). Si S3 répond mal, Workhorse le dira :
+
+### Voir les logs netapp
+# Exemple avec aws-cli
+export AWS_ACCESS_KEY_ID="VOTRE_CLE"
+export AWS_SECRET_ACCESS_KEY="VOTRE_SECRET"
+aws s3 ls s3://nom-de-votre-bucket-lfs --endpoint-url https://votre-endpoint.com
+Erreur 404 dans les logs S3 $\rightarrow$ Vos données LFS sont perdues ou déplacées, il faut nettoyer la base GitLab.
+
+1. Le passage strict à la Signature V4
+
+C'est le coupable n°1. Les anciennes méthodes de signature (V2) sont désormais obsolètes. Si votre fournisseur S3 (comme un vieux Minio ou une région AWS spécifique) attend de la V2 ou si votre configuration ne précise pas explicitement la région, la 18.8 peut échouer là où la 18.5 "passait" par tolérance.
+
+Solution : Forcez la signature V4 dans votre gitlab.rb :
+gitlab_rails['lfs_object_store_connection'] = {
+  'provider' => 'AWS',
+  'region' => 'votre-region', # Indispensable pour la V4
+  'aws_signature_version' => 4,
+  # ...
+}
+
+Si vous utilisez un proxy ou un Object Storage compatible S3 (Scaleway, DigitalOcean, Minio), Workhorse exige désormais que les paramètres endpoint et path_style soient parfaitement alignés entre les blocs lfs et artifacts.
+
+Si vous avez ceci, vérifiez bien :
+
+    'path_style' => true : Obligatoire pour Minio ou si votre URL est de type [s3.example.com/bucket](https://s3.example.com/bucket).
+
+    'path_style' => false (par défaut) : Pour AWS ou les URL type bucket.s3.example.com.
+    
+Comment vérifier si c'est un problème de signature ?
+
+Regardez le log de Workhorse spécifiquement :    
+sudo tail -f /var/log/gitlab/gitlab-workhorse/current
+
+SignatureDoesNotMatch
+
+The AWS Access Key Id you provided does not exist in our records (alors que la clé est bonne)
+
+Pourquoi l'upgrade en 18.11.2 est quand même recommandé ?
+
+Il y a eu des correctifs dans la 18.10 concernant justement la manière dont Workhorse gère les requêtes pré-signées vers S3. Si vous êtes victime d'un bug de "handshake" introduit dans la 18.8, la 18.11.2 est beaucoup plus stable sur ce point.
+
+Vérifiez ce point précis : Dans votre /etc/gitlab/gitlab.rb, avez-vous bien une region de définie ? Même pour un Minio local, il faut souvent mettre us-east-1 par défaut pour que la Signature V4 fonctionne.
+
+
+!!!!!!!!!!!!REGION!!!!!!!!!!!!!!!!!!!!!
+Est-ce que votre bucket est sur AWS officiel ou un autre fournisseur ?
