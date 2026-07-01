@@ -1,0 +1,410 @@
+Comment ça marche vraiment quand tu pushes :
+
+Tu fais un git push
+GitLab détecte le .gitlab-ci.yml et crée un job
+Le GitLab Runner (qui tourne sur une machine = ton serveur/hôte) récupère ce job
+Le Runner exécute le job sur sa propre machine (l’hôte)
+Le job s’exécute avec le compte utilisateur sous lequel le Runner tourne
+
+C’est ça la clé : le Runner a un compte local sur l’hôte (ex: gitlab-runner, ou root, ou un autre utilisateur)
+
+Ton PC → git push → GitLab.com (ou self-hosted)
+                          ↓
+                   GitLab Runner (sur ton serveur)
+                          ↓
+               Exécute les commandes avec son utilisateur local
+                          ↓
+                 Podman / Buildah / Docker ...
+				 
+Par défaut, beaucoup de runners sont installés pour tourner en root (ou avec sudo).
+Mais comme on parlait de rootless, on veut justement que le Runner utilise un utilisateur normal (non-root) pour lancer Podman et Buildah.
+
+sudo useradd -m -s /bin/bash gitlab-runner
+sudo usermod --add-subuids 100000-165535 --add-subgids 100000-165535 gitlab-runner
+
+sudo su - gitlab-runner
+
+# En tant que gitlab-runner :
+mkdir -p ~/.config/containers
+
+cat > ~/.config/containers/storage.conf << EOF
+[storage]
+driver = "overlay"
+
+[storage.options]
+mount_program = "/usr/bin/fuse-overlayfs"
+EOF
+
+
+sudo -u gitlab-runner bash
+
+# Télécharger et installer le runner
+curl -L https://gitlab.com/gitlab-org/gitlab-runner/-/releases/latest/download/gitlab-runner-linux-amd64 -o /usr/local/bin/gitlab-runner
+chmod +x /usr/local/bin/gitlab-runner
+
+gitlab-runner register
+
+Lors de l’enregistrement :
+
+Choisis l’exécuteur shell (le plus simple pour rootless Podman)
+Ajoute des tags (ex: podman, linux)
+
+4. Lancer le Runner en tant que service utilisateur (recommandé)
+Bashgitlab-runner install --user gitlab-runner --working-directory /home/gitlab-runner
+gitlab-runner start
+
+Dans ton .gitlab-ci.yml
+Tu peux maintenant utiliser Podman tranquillement :
+build:
+  stage: build
+  tags:
+    - podman
+  script:
+    - podman --version
+    - buildah --version
+    - buildah bud -t monimage:$CI_COMMIT_SHORT_SHA .
+    - podman push monimage:$CI_COMMIT_SHORT_SHA registry.gitlab.com/...Résumé clair :
+
+Oui, la CI utilise bien le compte local du runner sur l’hôte.
+Pour être en rootless, il faut que ce compte local ne soit pas root.
+On crée donc un utilisateur dédié (gitlab-runner) configuré pour Podman rootless.
+
+L’erreur de certificat arrive généralement quand tu fais podman pull ou buildah bud vers un registry qui utilise un certificat auto-signé ou une AC interne (ex. : ton registry GitLab self-hosted, Harbor, Nexus, etc.).
+Voici les solutions adaptées à ton cas (rootless + exécuteur shell).
+1. Solution recommandée : Certificat spécifique au registry (la plus propre)
+Crée le dossier pour le registry sur l’hôte (en tant que l’utilisateur gitlab-runner) :
+Bash
+
+# En tant que gitlab-runner (ou sudo -u gitlab-runner)
+mkdir -p ~/.config/containers/certs.d/ton-registry.example.com
+
+# En tant que gitlab-runner (ou sudo -u gitlab-runner)
+mkdir -p ~/.config/containers/certs.d/ton-registry.example.com
+
+Important :
+
+Le nom du dossier doit correspondre exactement au hostname du registry (sans https://).
+Le fichier doit s’appeler ca.crt.
+
+Ensuite, dans ton .gitlab-ci.yml, tu peux faire directement :
+
+
+pull-and-build:
+  stage: build
+  script:
+    - podman pull ton-registry.example.com/monimage:tag
+    - buildah bud -t monimage .
+	
+2. Solution alternative : Ajouter l’AC dans l’image de base du job
+Si tu utilises une image ubuntu, debian, fedora, etc. dans ton job :
+
+build:
+  stage: build
+  image: ubuntu:24.04   # ou fedora, rockylinux, etc.
+  before_script:
+    - apt-get update && apt-get install -y ca-certificates
+    - |
+      mkdir -p /usr/local/share/ca-certificates/extra
+      # Copie ton certificat (via variable GitLab ou artifact)
+      echo "$CA_ROOT_CERT" > /usr/local/share/ca-certificates/extra/ma-ca.crt
+      update-ca-certificates
+  script:
+    - podman pull ...
+	
+Avec une variable GitLab (recommandé) :
+
+Va dans Settings > CI/CD > Variables
+Crée une variable masquée CA_ROOT_CERT avec le contenu complet du .crt
+
+3. Solution temporaire (pour débloquer rapidement)
+Ajoute l’option --tls-verify=false (attention : moins sécurisé) :
+- podman pull --tls-verify=false ton-registry.example.com/monimage:tag
+- buildah bud --tls-verify=false ...
+
+Conseils supplémentaires
+
+Vérifie le nom exact du registry avec podman info ou dans ton erreur.
+Après avoir ajouté le certificat, tu peux tester en ligne de commande sur le runner :
+
+podman pull ton-registry.example.com/monimage:tag
+Si tu utilises souvent ce registry, ajoute-le aussi dans ~/.config/containers/registries.conf pour simplifier.
+
+
+✅ Solution 1 est la plus recommandée et la plus sécurisée dans ton cas.
+Pourquoi la Solution 1 (certs.d sur l’hôte) est meilleure :
+
+C’est la méthode officielle et standard de Podman pour faire confiance à un registry avec une AC personnalisée (~/.config/containers/certs.d/ ou /etc/containers/certs.d/).
+Elle configure le client Podman/Buildah directement au niveau de l’utilisateur rootless → cela s’applique à toutes les commandes podman pull, podman push, buildah bud, etc.
+Le certificat reste sur l’hôte (dans le home de gitlab-runner), il n’est pas copié dans chaque job.
+Moins de risque d’exposition (tu ne mets pas le certificat dans une variable GitLab ou dans les logs).
+Plus propre, plus maintenable et performant.
+
+Solution 2 (dans l’image du job) :
+Elle est utile dans d’autres cas :
+
+Quand tu as besoin que des outils à l’intérieur du conteneur (apt, curl, git, etc.) fassent confiance à l’AC.
+Mais elle est moins efficace pour Podman lui-même, car Podman tourne sur l’hôte (même si tu es dans un job avec image: ubuntu).
+
+Donc pour ton erreur de certificat lors du podman pull / buildah, la Solution 1 est clairement la bonne.
+Configuration finale recommandée (récapitulatif)
+
+mkdir -p ~/.config/containers/certs.d/ton-registry.example.com:443
+cp /chemin/vers/ta-ca-racine.crt ~/.config/containers/certs.d/ton-registry.example.com/ca.crt
+
+Le dossier doit porter le hostname exact du registry (avec le port si ce n’est pas 443).
+Le fichier doit s’appeler ca.crt.
+
+Redémarre ensuite le runner ou la session pour être sûr.
+Dans ton .gitlab-ci.yml tu peux alors faire tranquillement :
+
+Le dossier doit porter le hostname exact du registry (avec le port si ce n’est pas 443).
+Le fichier doit s’appeler ca.crt.
+
+Redémarre ensuite le runner ou la session pour être sûr.
+Dans ton .gitlab-ci.yml tu peux alors faire tranquillement :
+
+
+
+Avec l’exécuteur shell + un seul utilisateur (gitlab-runner) :
+
+Tous les jobs de tous les projets s’exécutent avec les mêmes droits sur la machine.
+Un job malveillant (ou un pipeline compromis) peut potentiellement :
+Lire le code source des autres projets (dans /home/gitlab-runner/builds/)
+Accéder aux caches, artefacts, ou variables d’autres jobs
+Modifier des fichiers appartenant à gitlab-runner
+
+Même en rootless Podman, l’isolation reste faible car tout tourne sous le même utilisateur Linux.
+
+GitLab lui-même déconseille fortement l’exécuteur shell pour des environnements multi-projets, surtout si certains projets sont publics ou moins fiables.
+
+Avec l’exécuteur shell + un seul utilisateur (gitlab-runner) :
+
+Tous les jobs de tous les projets s’exécutent avec les mêmes droits sur la machine.
+Un job malveillant (ou un pipeline compromis) peut potentiellement :
+Lire le code source des autres projets (dans /home/gitlab-runner/builds/)
+Accéder aux caches, artefacts, ou variables d’autres jobs
+Modifier des fichiers appartenant à gitlab-runner
+
+Même en rootless Podman, l’isolation reste faible car tout tourne sous le même utilisateur Linux.
+
+GitLab lui-même déconseille fortement l’exécuteur shell pour des environnements multi-projets, surtout si certains projets sont publics ou moins fiables.
+
+Avec l’exécuteur shell + un seul utilisateur (gitlab-runner) :
+
+Tous les jobs de tous les projets s’exécutent avec les mêmes droits sur la machine.
+Un job malveillant (ou un pipeline compromis) peut potentiellement :
+Lire le code source des autres projets (dans /home/gitlab-runner/builds/)
+Accéder aux caches, artefacts, ou variables d’autres jobs
+Modifier des fichiers appartenant à gitlab-runner
+
+Même en rootless Podman, l’isolation reste faible car tout tourne sous le même utilisateur Linux.
+
+[[runners]]
+  name = "mon-runner-podman"
+  executor = "docker"
+  [runners.docker]
+    host = "unix:///run/user/XXXX/podman/podman.sock"  # Remplace XXXX par l'UID de gitlab-runner
+    tls_verify = false
+    image = "alpine"   # image par défaut
+    privileged = false
+    # Autres options de sécurité
+    cap_add = ["SYS_ADMIN"]  # parfois nécessaire pour fuse
+    devices = ["/dev/fuse"]
+gitlab-runner restart
+
+GitLab lui-même déconseille fortement l’exécuteur shell pour des environnements multi-projets, surtout si certains projets sont publics ou moins fiables.
+
+Bonne question ! Voici comment vérifier précisément l’URL de ta registry.
+1. Méthode la plus rapide : Dans un job GitLab CI
+Ajoute temporairement ce job dans ton .gitlab-ci.yml :	
+debug-registry:
+  stage: build
+  script:
+    - echo "CI_REGISTRY = $CI_REGISTRY"
+    - echo "CI_REGISTRY_IMAGE = $CI_REGISTRY_IMAGE"
+    - echo "CI_REGISTRY_USER = $CI_REGISTRY_USER"
+    - podman info | grep -E "registry|search"
+  tags:
+    - podman   # ou ton tag	
+	
+1. Sur le serveur du Runner (en tant que root ou sudo)
+Place ton certificat CA à un endroit fixe sur l’hôte :	
+sudo mkdir -p /etc/gitlab-runner/certs
+sudo cp /chemin/vers/ta-ca-racine.crt /etc/gitlab-runner/certs/ca-racine.crt
+sudo chmod 644 /etc/gitlab-runner/certs/ca-racine.crt	
+
+[[runners]]
+  name = "mon-runner"
+  executor = "shell"Ouvre le fichier (généralement /etc/gitlab-runner/config.toml) et ajoute/modifie la section de ton runner :
+  # Pas de "volumes" natif en shell, donc on utilise un before_script global ou par job
+	
+	Passer en exécuteur docker (recommandé pour le mapping)
+	[[runners]]
+  name = "mon-runner-podman"
+  executor = "docker"
+  [runners.docker]
+    host = "unix:///run/user/$(id -u gitlab-runner)/podman/podman.sock"  # adapte si besoin
+    image = "ubuntu:24.04"   # ou alpine, etc.
+    privileged = false
+    volumes = [
+      "/cache",
+      "/etc/gitlab-runner/certs/ca-racine.crt:/etc/gitlab-runner/certs/ca-racine.crt:ro"
+    ]
+	
+	3. Dans ton .gitlab-ci.yml (utilisation dans les jobs)
+	before_script:
+  - apt-get update -qq && apt-get install -y ca-certificates
+  - cp /etc/gitlab-runner/certs/ca-racine.crt /usr/local/share/ca-certificates/
+  - update-ca-certificates
+
+build:
+  script:
+    - podman pull registry.fqdn/monimage:tag
+    - buildah bud ...
+	
+	Ou pour Fedora/RHEL/Alma :
+	before_script:
+  - dnf install -y ca-certificates
+  - cp /etc/gitlab-runner/certs/ca-racine.crt /etc/pki/ca-trust/source/anchors/
+  - update-ca-trust
+
+
+debug-ca-cert:
+  stage: build
+  script:
+    # 1. Vérifier que le fichier est bien monté
+    - echo "=== Fichier monté ==="
+    - ls -l /etc/gitlab-runner/certs/ca-racine.crt || echo "Fichier non trouvé !"
+
+    # 2. Vérifier que le système le reconnaît (Debian/Ubuntu)
+    - echo "=== Trust store Ubuntu/Debian ==="
+    - cat /etc/ssl/certs/ca-certificates.crt | grep -A 5 "BEGIN CERTIFICATE" | tail -10 || echo "Pas de CA dans le trust store"
+
+    # 3. Mise à jour + vérification (à adapter selon ton OS)
+    - echo "=== Mise à jour du trust store ==="
+    - apt-get update -qq && apt-get install -y ca-certificates
+    - cp /etc/gitlab-runner/certs/ca-racine.crt /usr/local/share/ca-certificates/
+    - update-ca-certificates --fresh
+    - update-ca-certificates -v | grep "added"
+
+    # 4. Vérifier avec openssl (très fiable)
+    - echo "=== Test OpenSSL ==="
+    - echo | openssl s_client -connect registry.fqdn:443 -CAfile /etc/gitlab-runner/certs/ca-racine.crt 2>&1 | grep -E "Verify return code|subject|issuer"
+
+    # 5. Test Podman
+    - echo "=== Test Podman ==="
+    - podman info | grep -E "registry|search"
+    - podman pull --tls-verify=true registry.fqdn/monimage:tag || echo "Échec du pull"
+
+  tags:
+    - ton-tag-runner
+
+Commandes rapides à mettre dans un before_script ou un job
+	
+before_script:
+  - |
+    echo "Vérification CA..."
+    ls -l /etc/gitlab-runner/certs/
+    update-ca-certificates --fresh
+    openssl version
+    echo | openssl s_client -connect registry.fqdn:443 -showcerts 2>&1 | head -20
+	
+	
+	---
+- name: Mise à jour des GitLab Runners + Certificat CA
+  hosts: gitlab_runners
+  become: yes
+  vars:
+    ca_cert_src: "/chemin/local/sur/ton/ansible/ta-ca-racine.crt"  # ← à adapter
+    ca_cert_dest: "/etc/gitlab-runner/certs/ca-racine.crt"
+    runner_user: "gitlab-runner"
+
+  tasks:
+
+    - name: Créer le dossier pour les certificats
+      ansible.builtin.file:
+        path: /etc/gitlab-runner/certs
+        state: directory
+        owner: "{{ runner_user }}"
+        group: "{{ runner_user }}"
+        mode: '0755'
+
+    - name: Déployer le certificat CA sur le runner
+      ansible.builtin.copy:
+        src: "{{ ca_cert_src }}"
+        dest: "{{ ca_cert_dest }}"
+        owner: "{{ runner_user }}"
+        group: "{{ runner_user }}"
+        mode: '0644'
+
+    - name: Configurer le volume dans config.toml (Docker executor)
+      ansible.builtin.blockinfile:
+        path: /etc/gitlab-runner/config.toml
+        marker: "# {mark} ANSIBLE MANAGED - CA Certificate"
+        block: |
+          [[runners]]
+            [runners.docker]
+              volumes = [
+                "/cache",
+                "{{ ca_cert_dest }}:{{ ca_cert_dest }}:ro"
+              ]
+      when: "'docker' in runner_executor"  # variable à définir si besoin
+
+    - name: Redémarrer le GitLab Runner
+      ansible.builtin.systemd:
+        name: gitlab-runner
+        state: restarted
+        daemon_reload: yes
+
+    - name: Vérification du certificat sur le runner
+      ansible.builtin.command: ls -l {{ ca_cert_dest }}
+      changed_when: false
+      register: cert_check
+
+    - name: Afficher le statut
+      ansible.builtin.debug:
+        msg: "Certificat déployé → {{ cert_check.stdout }}"
+		
+		
+		UPDATE des Runners
+		
+		---
+- name: Mise à jour du GitLab Runner
+  hosts: gitlab_runners
+  become: yes
+  vars:
+    runner_version: "latest"   # ou une version précise ex: "17.0.0"
+
+  tasks:
+
+    - name: Arrêter le service GitLab Runner
+      ansible.builtin.systemd:
+        name: gitlab-runner
+        state: stopped
+
+    - name: Télécharger la dernière version du Runner
+      ansible.builtin.get_url:
+        url: "https://gitlab.com/gitlab-org/gitlab-runner/-/releases/{{ runner_version }}/downloads/gitlab-runner-linux-amd64"
+        dest: /usr/local/bin/gitlab-runner
+        mode: '0755'
+        owner: root
+        group: root
+      when: runner_version == "latest"
+
+    - name: Vérifier la version installée
+      ansible.builtin.command: /usr/local/bin/gitlab-runner --version
+      register: runner_version_check
+      changed_when: false
+
+    - name: Redémarrer le service
+      ansible.builtin.systemd:
+        name: gitlab-runner
+        state: restarted
+        daemon_reload: yes
+        enabled: yes
+
+    - name: Afficher la version après mise à jour
+      ansible.builtin.debug:
+        msg: "GitLab Runner mis à jour → {{ runner_version_check.stdout }}"
+		
+		ansible-playbook update_gitlab_runner.yml -i inventory.ini --limit mon-runner
