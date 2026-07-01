@@ -1,0 +1,64 @@
+# ==================== CONFIGURATION ====================
+$ConditionalForwarders = @{
+    "zone1.dom.intra"   = @("IP_DU_SERVEUR_ZONE1_1", "IP_DU_SERVEUR_ZONE1_2")   # Remplace par les vraies IPs
+    "zone2.dom.intra"   = @("IP_DU_SERVEUR_ZONE2")                              # Exemple pour une seule IP
+    # Ajoute ici les autres zones
+    # "zone3.dom.intra" = @("10.20.30.40", "10.20.30.41")
+}
+
+$ReplicationScope = "Domain"   # "Domain" ou "Forest"
+# =======================================================
+
+foreach ($zone in $ConditionalForwarders.Keys) {
+    # Vérifier si le conditional forwarder existe déjà
+    if (Get-DnsServerConditionalForwarderZone -Name $zone -ErrorAction SilentlyContinue) {
+        Write-Host "Mise à jour du Conditional Forwarder pour $zone" -ForegroundColor Yellow
+        Set-DnsServerConditionalForwarderZone `
+            -Name $zone `
+            -MasterServers $ConditionalForwarders[$zone] `
+            -PassThru
+    }
+    else {
+        Write-Host "Création du Conditional Forwarder pour $zone" -ForegroundColor Green
+        Add-DnsServerConditionalForwarderZone `
+            -Name $zone `
+            -MasterServers $ConditionalForwarders[$zone] `
+            -ReplicationScope $ReplicationScope `
+            -PassThru
+    }
+}
+
+Write-Host "`nConfiguration terminée !" -ForegroundColor Cyan
+
+
+# Voir tous les conditional forwarders
+Get-DnsServerConditionalForwarderZone | Select Name, MasterServers, ReplicationScope
+
+# Tester la résolution
+Resolve-DnsName -Name "serveur.zone1.dom.intra" -Server localhost
+
+# 1. Vérifier que le conditional forwarder est bien créé
+Get-DnsServerConditionalForwarderZone | 
+  Select Name, MasterServers, ReplicationScope, DirectoryPartitionName | 
+  Format-Table -AutoSize
+
+# 2. Tester la résolution (le plus important)
+Resolve-DnsName -Name "ordinateur.zone1.dom.intra" -Server localhost -ErrorAction Stop
+
+# Test détaillé
+Resolve-DnsName -Name "test.zone1.dom.intra" `
+    -Server localhost `
+    -DnsOnly `
+    -NoHostsFile | 
+  Select Name, Type, IPAddress
+
+nslookup
+server 127.0.0.1          (ou l'IP de ton DC)
+set debug
+test.zone1.dom.intra
+
+$zones = "zone1.dom.intra","zone2.dom.intra"
+foreach ($z in $zones) {
+    Write-Host "`n--- Test de $z ---" -ForegroundColor Cyan
+    Resolve-DnsName -Name "dummy.$z" -Server localhost -ErrorAction SilentlyContinue
+}
