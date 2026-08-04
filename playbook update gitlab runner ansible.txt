@@ -1,0 +1,300 @@
+---
+# playbook-update-gitlab-runner.yml
+# Usage :
+#   ansible-playbook -i inventory playbook-update-gitlab-runner.yml \
+#     -e gitlab_url=https://gitlab.example.com \
+#     -e gitlab_token=glpat-xxxxxxxx \
+#     -e runner_id=42
+
+- name: Mise à jour GitLab Runner (un par un)
+  hosts: gitlab_runners
+  become: true
+  serial: 1                    # ← un runner à la fois
+  any_errors_fatal: true
+
+  vars:
+    gitlab_url: "https://gitlab.example.com"   # à surcharger
+    gitlab_token: ""                           # token avec scope manage_runner / api
+    runner_id: ""                              # ID numérique du runner dans GitLab
+    gpg_key_url: "https://packages.gitlab.com/runner/gitlab-runner/gpgkey/runner-gitlab-runner-49F16C5CC3A0F81F.pub.gpg"
+    keyring_path: "/usr/share/keyrings/runner_gitlab-runner-archive-keyring.gpg"
+    # ou /etc/apt/keyrings/runner_gitlab-runner-archive-keyring.gpg selon ton installation
+    wait_timeout: 3600         # timeout max en secondes pour attendre la fin des jobs
+    wait_delay: 30             # intervalle de polling
+
+  tasks:
+
+    # -------------------------------------------------------
+    # 1. Vérifications préalables
+    # -------------------------------------------------------
+    - name: Vérifier que gitlab-runner est installé
+      ansible.builtin.command: which gitlab-runner
+      register: runner_bin
+      changed_when: false
+      failed_when: runner_bin.rc != 0
+
+    - name: Afficher la version actuelle
+      ansible.builtin.command: gitlab-runner --version
+      register: current_version
+      changed_when: false
+
+    - name: Afficher version
+      ansible.builtin.debug:
+        msg: "Version actuelle → {{ current_version.stdout_lines[0] | default(current_version.stdout) }}"
+
+    # -------------------------------------------------------
+    # 2. Mettre le runner en pause via l'API GitLab
+    # -------------------------------------------------------
+    - name: Mettre le runner en pause (API)
+      ansible.builtin.uri:
+        url: "{{ gitlab_url }}/api/v4/runners/{{ runner_id }}"
+        method: PUT
+        headers:
+          PRIVATE-TOKEN: "{{ gitlab_token }}"
+        body_format: form-urlencoded
+        body:
+          paused: "true"
+        status_code: 200
+      register: pause_result
+      when: runner_id | length > 0 and gitlab_token | length > 0
+
+    - name: Confirmer la pause
+      ansible.builtin.debug:
+        msg: "Runner {{ runner_id }} mis en pause"
+
+    # -------------------------------------------------------
+    # 3. Attendre la fin des jobs en cours
+    # -------------------------------------------------------
+    - name: Attendre que tous les jobs soient terminés
+      ansible.builtin.uri:
+        url: "{{ gitlab_url }}/api/v4/runners/{{ runner_id }}/jobs?status=running"
+        method: GET
+        headers:
+          PRIVATE-TOKEN: "{{ gitlab_token }}"
+        status_code: 200
+      register: running_jobs
+      until: running_jobs.json | length == 0
+      retries: "{{ (wait_timeout / wait_delay) | int }}"
+      delay: "{{ wait_delay }}"
+      when: runner_id | length > 0 and gitlab_token | length > 0
+
+    - name: Afficher le statut d'attente
+      ansible.builtin.debug:
+        msg: "Aucun job en cours sur le runner {{ runner_id }}"
+
+    # -------------------------------------------------------
+    # 4. Mise à jour de la clé GPG du dépôt GitLab Runner
+    # -------------------------------------------------------
+    - name: Créer le répertoire keyrings si nécessaire
+      ansible.builtin.file:
+        path: "{{ keyring_path | dirname }}"
+        state: directory
+        mode: "0755"
+
+    - name: Télécharger la nouvelle clé GPG
+      ansible.builtin.get_url:
+        url: "{{ gpg_key_url }}"
+        dest: "/tmp/runner-gitlab-runner.pub.gpg"
+        mode: "0644"
+        force: true
+
+    - name: Convertir et installer la clé GPG (dearmor)
+      ansible.builtin.shell: |
+        gpg --dearmor < /tmp/runner-gitlab-runner.pub.gpg > {{ keyring_path }}
+      args:
+        creates: "{{ keyring_path }}"   # ne recrée pas si déjà présent (on force quand même)
+      # On force toujours pour être sûr d'avoir la dernière version
+      changed_when: true
+
+    - name: Forcer la mise à jour de la clé
+      ansible.builtin.shell: |
+        gpg --dearmor < /tmp/runner-gitlab-runner.pub.gpg > {{ keyring_path }}
+      changed_when: true
+
+    - name: Vérifier les permissions de la clé
+      ansible.builtin.file:
+        path: "{{ keyring_path }}"
+        mode: "0644"
+        owner: root
+        group: root
+
+    # Optionnel : nettoyer l'ancienne clé dans trusted.gpg si elle existe
+    - name: Supprimer l'ancienne clé apt-key (si présente)
+      ansible.builtin.command: apt-key del 3F01618A51312F3F
+      register: aptkey_del
+      failed_when: false
+      changed_when: aptkey_del.rc == 0
+
+    # -------------------------------------------------------
+    # 5. Update + Upgrade système + gitlab-runner
+    # -------------------------------------------------------
+    - name: apt update
+      ansible.builtin.apt:
+        update_cache: true
+        cache_valid_time: 0
+
+    - name: Upgrade complet du système (recommandé)
+      ansible.builtin.apt:
+        upgrade: dist          # ou "safe" selon ta politique
+        autoremove: true
+        autoclean: true
+
+    # Ou uniquement le package runner si tu préfères :
+    # - name: Upgrade gitlab-runner uniquement
+    #   ansible.builtin.apt:
+    #     name: gitlab-runner
+    #     state: latest
+
+    - name: Afficher la nouvelle version
+      ansible.builtin.command: gitlab-runner --version
+      register: new_version
+      changed_when: false
+
+    - name: Version après upgrade
+      ansible.builtin.debug:
+        msg: "Nouvelle version → {{ new_version.stdout_lines[0] | default(new_version.stdout) }}"
+
+    # -------------------------------------------------------
+    # 6. Redémarrer le service (propre)
+    # -------------------------------------------------------
+    - name: Redémarrer le service gitlab-runner
+      ansible.builtin.systemd:
+        name: gitlab-runner
+        state: restarted
+        enabled: true
+        daemon_reload: true
+
+    - name: Attendre que le service soit actif
+      ansible.builtin.systemd:
+        name: gitlab-runner
+      register: service_status
+      until: service_status.status.ActiveState == "active"
+      retries: 10
+      delay: 3
+
+    # -------------------------------------------------------
+    # 7. Réactiver le runner
+    # -------------------------------------------------------
+    - name: Réactiver le runner (API)
+      ansible.builtin.uri:
+        url: "{{ gitlab_url }}/api/v4/runners/{{ runner_id }}"
+        method: PUT
+        headers:
+          PRIVATE-TOKEN: "{{ gitlab_token }}"
+        body_format: form-urlencoded
+        body:
+          paused: "false"
+        status_code: 200
+      when: runner_id | length > 0 and gitlab_token | length > 0
+
+    - name: Vérifier que le runner est bien online
+      ansible.builtin.command: gitlab-runner verify
+      register: verify
+      changed_when: false
+      failed_when: "'is alive' not in verify.stdout and 'is alive' not in verify.stderr"
+
+    - name: Fin de la procédure
+      ansible.builtin.debug:
+        msg: |
+          ✅ Runner {{ inventory_hostname }} mis à jour avec succès.
+          Version : {{ new_version.stdout_lines[0] | default(new_version.stdout) }}
+  
+  [gitlab_runners]
+runner01 ansible_host=10.0.0.11 runner_id=42
+runner02 ansible_host=10.0.0.12 runner_id=43
+runner03 ansible_host=10.0.0.13 runner_id=44
+  
+          ansible-playbook -i inventory playbook-update-gitlab-runner.yml \
+  -e gitlab_url=https://gitlab.example.com \
+  -e gitlab_token=glpat-xxxxxxxxxxxxxxxxxxxx \
+  --limit runner01          # pour tester un seul runner d’abord
+  
+  ÉtapeDétailserial: 1Garantit qu’un seul runner est traité à la foisPause APILe runner n’accepte plus de nouveaux jobsAttente jobsPolling de l’API /runners/:id/jobs?status=runningClé GPGTéléchargement de la clé actuelle 49F16C5CC3A0F81F et installation dans le keyringUpgradeapt upgrade dist (ou uniquement gitlab-runner si tu préfères)ResumeRéactivation via l’API
+  
+  Étape,Détail
+serial: 1,Garantit qu’un seul runner est traité à la fois
+Pause API,Le runner n’accepte plus de nouveaux jobs
+Attente jobs,Polling de l’API /runners/:id/jobs?status=running
+Clé GPG,Téléchargement de la clé actuelle 49F16C5CC3A0F81F et installation dans le keyring
+Upgrade,apt upgrade dist (ou uniquement gitlab-runner si tu préfères)
+Resume,Réactivation via l’API
+
+#!/bin/bash
+
+GITLAB_URL="https://gitlab.example.com"
+TOKEN="glpat-xxxxxxxxxxxxxxxxxxxx"
+PER_PAGE=100
+
+page=1
+all_projects="[]"
+
+while true; do
+  response=$(curl -s --header "PRIVATE-TOKEN: $TOKEN" \
+    "${GITLAB_URL}/api/v4/projects?membership=true&simple=true&per_page=${PER_PAGE}&page=${page}")
+
+  # Si la page est vide → on arrête
+  count=$(echo "$response" | jq 'length')
+  if [[ "$count" -eq 0 ]]; then
+    break
+  fi
+
+  # On fusionne avec le résultat précédent
+  all_projects=$(echo "$all_projects" "$response" | jq -s 'add')
+
+  ((page++))
+done
+
+# Affichage formaté
+echo "$all_projects" | jq -r '.[] | "\(.id)\t\(.path_with_namespace)\t\(.web_url)"'
+
+
+python
+#!/usr/bin/env python3
+import requests
+import sys
+
+GITLAB_URL = "https://gitlab.example.com"
+TOKEN = "glpat-xxxxxxxxxxxxxxxxxxxx"
+PER_PAGE = 100
+
+headers = {"PRIVATE-TOKEN": TOKEN}
+page = 1
+all_projects = []
+
+while True:
+    r = requests.get(
+        f"{GITLAB_URL}/api/v4/projects",
+        headers=headers,
+        params={
+            "membership": "true",
+            "simple": "true",
+            "per_page": PER_PAGE,
+            "page": page,
+        },
+        timeout=30,
+    )
+    r.raise_for_status()
+    data = r.json()
+
+    if not data:
+        break
+
+    all_projects.extend(data)
+    page += 1
+
+# Affichage formaté
+for p in all_projects:
+    print(f"{p['id']}\t{p['path_with_namespace']}\t{p['web_url']}")
+    
+    
+    page=1
+while true; do
+  response=$(curl -s -D /tmp/headers.txt --header "PRIVATE-TOKEN: $TOKEN" \
+    "${GITLAB_URL}/api/v4/projects?membership=true&simple=true&per_page=100&page=${page}")
+
+  echo "$response" | jq -r '.[] | "\(.id)\t\(.path_with_namespace)"'
+
+  next=$(grep -i '^X-Next-Page:' /tmp/headers.txt | awk '{print $2}' | tr -d '\r')
+  [[ -z "$next" || "$next" == "0" ]] && break
+  page=$next
+done
