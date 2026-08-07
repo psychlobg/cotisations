@@ -1,0 +1,303 @@
+Cette commande supprime tous les conteneurs arrêtés, les réseaux inutilisés et les images orphelines (sans tag) :
+Bash
+podman system prune -f
+
+Pour inclure également les images qui ne sont pas utilisées par un conteneur actif (attention, cela videra le cache des pipelines et nécessitera un re-téléchargement lors du prochain job) :
+Bash
+podman system prune -a -f
+
+Étape B : Nettoyer spécifiquement les images
+
+Si vous souhaitez uniquement nettoyer les images non utilisées :
+Bash
+
+podman image prune -a -f
+
+    Note importante (Root vs Rootless) :
+    Si votre GitLab Runner s'exécute en Rootless (sous un utilisateur spécifique, ex: gitlab-runner), vous devez exécuter la commande avec cet utilisateur :
+    Bash
+
+    sudo -u gitlab-runner podman system prune -a -f
+
+1.Créer un script de nettoyage :Créez un fichier de script sur l'hôte, par exemple /usr/local/bin/clean-podman.sh :Bash#!/bin/bash
+# Nettoyage des conteneurs, images orphelines et volumes inutilisés
+
+# Si le runner s'exécute en mode root :
+podman system prune -a -f --filter "until=168h"
+
+# Si le runner s'exécute en mode rootless sous l'utilisateur 'gitlab-runner' :
+# sudo -u gitlab-runner podman system prune -a -f --filter "until=168h"
+
+L'option --filter "until=168h" permet de conserver les images et caches utilisés au cours des 7 derniers jours (168h) afin de préserver les performances du cache de build.2.Rendre le script exécutable :Accordez les permissions d'exécution :Bashchmod +x /usr/local/bin/clean-podman.sh
+
+3.Configurer la tâche Cron :Ouvrez la crontab système (ou celle de l'utilisateur dédié) :Bashcrontab -e
+Ajoutez une règle pour exécuter le nettoyage tous les dimanches à 3h du matin :cron0 3 * * 0 /usr/local/bin/clean-podman.sh > /dev/null 2>&1
+
+---
+- name: Nettoyage automatique du stockage Podman Rootless pour GitLab Runner
+  hosts: gitlab_runners
+  become: true
+  vars:
+    runner_user: "gitlab-runner"
+    clean_script_path: "/usr/local/bin/clean-podman-rootless.sh"
+    keep_history_hours: "168h" # Conserve le cache des 7 derniers jours
+
+  tasks:
+    - name: Créer le script de nettoyage Podman
+      ansible.builtin.copy:
+        dest: "{{ clean_script_path }}"
+        mode: '0755'
+        owner: root
+        group: root
+        content: |
+          #!/bin/bash
+          # Exécuté dans le contexte de l'utilisateur rootless via Machinectl/DBus
+          export XDG_RUNTIME_DIR="/run/user/$(id -u {{ runner_user }})"
+          
+          # Nettoyage des images et conteneurs inutilisés depuis plus de X heures
+          podman system prune -a -f --filter "until={{ keep_history_hours }}"
+
+    - name: Planifier la tâche Cron pour l'utilisateur gitlab-runner
+      ansible.builtin.cron:
+        name: "Nettoyage hebdomadaire des images Podman rootless"
+        user: "{{ runner_user }}"
+        job: "{{ clean_script_path }} > /dev/null 2>&1"
+        minute: "0"
+        hour: "3"
+        weekday: "0" # Dimanche à 03h00
+        state: present
+
+---
+- name: Programmer le prunage Podman direct dans la crontab de l'utilisateur
+  ansible.builtin.cron:
+    name: "Podman System Prune Rootless"
+    user: "gitlab-runner"
+    job: "podman system prune -a -f --filter 'until=168h' > /dev/null 2>&1"
+    minute: "0"
+    hour: "3"
+    weekday: "0"
+    state: present
+
+                                                       Note sur le mode Rootless avec Ansible / Cron :
+Lorsque cron exécute une commande sous l'utilisateur gitlab-runner, certaines variables d'environnement comme XDG_RUNTIME_DIR peuvent manquer. Si vous constatez que la commande échoue dans le cron, l'utilisation de la première méthode avec le script shell (qui définit XDG_RUNTIME_DIR) garantit que Podman trouve bien le socket du démon utilisateur.
+Dans le monde Linux moderne, Systemd est supérieur à Cron pour planifier des tâches de maintenance complexes ou critiques comme le nettoyage de votre environnement Podman.
+
+Voici les raisons concrètes pour lesquelles Systemd (via les Service + Timer) est préférable :
+1. Gestion stricte de l'environnement Rootless (XDG_RUNTIME_DIR)
+
+    Le problème avec Cron : Cron s'exécute dans un environnement shell extrêmement pauvre. En mode Podman rootless, Podman a besoin du socket utilisateur situé dans /run/user/<UID>. Avec Cron, ce répertoire ou ces variables (XDG_RUNTIME_DIR, DBUS_SESSION_BUS_ADDRESS) manquent souvent, ce qui fait échouer la commande.
+
+    L'avantage Systemd : Un service utilisateur Systemd (systemctl --user) s'exécute nativement dans la session de l'utilisateur. Il hérite automatiquement de toutes les variables d'environnement et sockets requis par Podman.
+
+2. Visibilité et Traçabilité (Journaux)
+
+    Avec Cron : Si votre tâche Cron échoue, la sortie d'erreur est envoyée par mail local (mailx) — souvent non configuré — ou perdue si vous avez redirigé avec > /dev/null 2>&1. Vous ne savez pas si la tâche a échoué ou pourquoi.
+
+    Avec Systemd : Tous les logs de vos nettoyages sont centralisés et consultables très simplement avec journalctl :
+    Bash
+
+    # Voir l'historique des exécutions du nettoyage
+    journalctl -u podman-clean.service
+
+
+                                                       4. Test manuel et gestion simplifiée
+
+    Avec Cron : Pour tester la commande d'un cron sans attendre l'heure prévue, il faut copier-coller la ligne de la crontab dans un terminal.
+
+    Avec Systemd : Vous pouvez déclencher le nettoyage manuellement à tout moment pour valider qu'il fonctionne, sans attendre le timer :
+    Bash
+
+    systemctl --user start podman-clean.service
+
+Implémentation Ansible avec Systemd (Mode Rootless)
+
+Voici le playbook Ansible pour configurer un Service + Timer Systemd pour l'utilisateur gitlab-runner :
+YAML
+
+---
+- name: Configuration du nettoyage Podman via Systemd Timer (Rootless)
+  hosts: gitlab_runners
+  become: true
+  vars:
+    runner_user: "gitlab-runner"
+
+  tasks:
+    - name: S'assurer que le dossier systemd utilisateur existe
+      ansible.builtin.file:
+        path: "/home/{{ runner_user }}/.config/systemd/user"
+        state: directory
+        owner: "{{ runner_user }}"
+        group: "{{ runner_user }}"
+        mode: '0755'
+
+    - name: Créer le fichier Service Systemd
+      ansible.builtin.copy:
+        dest: "/home/{{ runner_user }}/.config/systemd/user/podman-clean.service"
+        owner: "{{ runner_user }}"
+        group: "{{ runner_user }}"
+        mode: '0644'
+        content: |
+          [Unit]
+          Description=Nettoyage automatique du cache Podman Rootless
+
+          [Service]
+          Type=oneshot
+          ExecStart=/usr/bin/podman system prune -a -f --filter "until=168h"
+
+    - name: Créer le fichier Timer Systemd
+      ansible.builtin.copy:
+        dest: "/home/{{ runner_user }}/.config/systemd/user/podman-clean.timer"
+        owner: "{{ runner_user }}"
+        group: "{{ runner_user }}"
+        mode: '0644'
+        content: |
+          [Unit]
+          Description=Timer hebdomadaire pour le nettoyage Podman
+
+          [Timer]
+          OnCalendar=Sun *-*-* 03:00:00
+          Persistent=true
+
+          [Install]
+          WantedBy=timers.target
+
+    - name: Permettre aux services utilisateur de tourner hors session active (Linger)
+      ansible.builtin.command:
+        cmd: "loginctl enable-linger {{ runner_user }}"
+        creates: "/var/lib/systemd/linger/{{ runner_user }}"
+
+    - name: Activer et démarrer le Timer Systemd pour l'utilisateur
+      ansible.builtin.systemd:
+        name: podman-clean.timer
+        state: started
+        enabled: true
+        scope: user
+      become_user: "{{ runner_user }}"
+
+    Le point clé (loginctl enable-linger) : Par défaut, Systemd arrête les services d'un utilisateur quand il se déconnecte. La commande loginctl enable-linger indique à Linux de laisser tourner les services Systemd de gitlab-runner en arrière-plan en permanence (nécessaire pour que le Timer se déclenche).
+
+. Vérifier l'état du Timer (La planification)
+
+Pour voir si le réveil est bien actif et connaître la date de la prochaine exécution :
+Bash
+
+systemctl --user status podman-clean.timer
+
+Pour afficher la liste de tous vos timers utilisateurs avec le compte à rebours :
+Bash
+
+systemctl --user list-timers
+
+Vous y verrez l'heure de la dernière exécution (LAST), de la prochaine (NEXT), et le temps restant (LEFT).
+2. Déclencher le nettoyage manuellement (Tester le Service)
+
+Vous n'avez pas besoin d'attendre la date planifiée pour vérifier que le nettoyage fonctionne. Vous pouvez démarrer le service à tout moment :
+Bash
+
+systemctl --user start podman-clean.service
+
+Pour vérifier le statut juste après l'avoir lancé :
+Bash
+
+systemctl --user status podman-clean.service
+
+3. Consulter les logs d'exécution (Journalctl)
+
+C'est le gros avantage par rapport à Cron : vous pouvez lire exactement la sortie de Podman lors des nettoyages passés.
+
+Pour voir tous les logs du service de nettoyage :
+Bash
+
+                                                       
+
+journalctl --user -u podman-clean.service
+
+Pour suivre les logs en direct ou voir uniquement les 20 dernières lignes :
+Bash
+
+journalctl --user -u podman-clean.service -n 20 -f
+
+    Rappel important pour le mode Rootless :
+    Si vous êtes connecté avec votre propre compte (admin, ubuntu, etc.) et que vous souhaitez exécuter ces commandes pour l'utilisateur gitlab-runner, basculez dans sa session avec :
+    Bash
+
+    sudo su - gitlab-runner
+
+    Ou ciblez directement son socket utilisateur depuis votre compte sudo :
+    Bash
+
+    sudo -u gitlab-runner XDG_RUNTIME_DIR=/run/user/$(id -u gitlab-runner) systemctl --user status podman-clean.timer
+
+
+Scénario A : Exécuteur docker avec socket Podman (Le cas "Conteneur Isolé classique")
+
+Si votre configuration ressemble à ceci :
+Ini, TOML
+
+[[runners]]
+  executor = "docker"
+  [runners.docker]
+    host = "unix:///run/user/1001/podman/podman.sock" # ou unix:///run/podman/podman.sock
+    image = "alpine:latest"
+
+    Fonctionnement : GitLab Runner utilise le plugin Docker, mais en le faisant pointer sur le socket API de Podman.
+
+    Ce que font vos jobs :
+
+        Vos étapes de script (script:) s'exécutent à l'intérieur du conteneur alpine (ou l'image définie dans votre CI).
+
+        Le conteneur du job est isolé du système hôte.
+
+    Le piège du stockage : Même si le job s'exécute dans son conteneur isolé, dès que l'exécuteur fait un pull de l'image (ex: alpine:latest), l'image est stockée sur l'hôte via le socket Podman (~/.local/share/containers/storage).
+
+    Est-ce que le job peut nettoyer ? Non ! Si votre .gitlab-ci.yml fait podman system prune, la commande échouera à l'intérieur du conteneur car le binaire podman ou le socket ne sont pas montés par défaut dans le job.
+
+Scénario B : Exécuteur shell (Non isolé)
+
+Si votre configuration utilise :
+Ini, TOML
+
+[[runners]]
+  executor = "shell"
+
+    Fonctionnement : Les commandes de vos pipelines s'exécutent directement dans un terminal bash sur la machine hôte sous l'utilisateur de la session (ex: gitlab-runner).
+
+    Est-ce isolé ? Non. Le job partage directement le stockage Podman du compte hôte.
+
+    Est-ce que le job peut nettoyer ? Oui. Si vous lancez podman system prune directement dans votre script .gitlab-ci.yml, il nettoiera immédiatement les images sur la machine hôte.
+
+Scénario C : Exécuteur docker avec Podman-in-Podman / Mount Socket (Isolement personnalisé)
+
+Si votre fichier montre que vous montez explicitement le socket Podman à l'intérieur des conteneurs du job :
+Ini, TOML
+
+[[runners]]
+  executor = "docker"
+  [runners.docker]
+    volumes = ["/run/user/1001/podman/podman.sock:/run/podman/podman.sock:ro"]
+
+    Fonctionnement : Le job s'exécute dans un conteneur isolé, mais on lui a donné un "tuyau" (le volume /run/user/...) pour parler au Podman de l'hôte.
+
+    Est-ce que le job peut nettoyer ? Si le socket est monté en lecture-écriture (rw), le conteneur du job peut déclencher un nettoyage sur l'hôte. S'il est en lecture seule (ro), il ne pourra pas.
+
+2. Test rapide en 30 secondes via le .gitlab-ci.yml
+
+Si vous n'avez pas accès directement au fichier config.toml du serveur hôte, vous pouvez ajouter ce petit job de diagnostic temporaire dans votre projet GitLab :
+YAML
+
+test_environnement:
+  script:
+    - echo "--- Identité et groupe ---"
+    - id
+    - echo "--- Détection de l'environnement conteneurisé ---"
+    - cat /proc/1/cgroup || true
+    - echo "--- Test de la commande Podman localement ---"
+    - podman --version || echo "Podman n'est pas accessible directement dans le job"
+
+    Si cat /proc/1/cgroup montre podman, docker ou containerd : Votre job tourne de manière isolée dans un conteneur.
+
+    Si podman --version répond "command not found" : Votre job est isolé dans un conteneur standard et n'a pas accès au démon de l'hôte (le nettoyage doit obligatoirement se faire via Cron/Systemd sur l'hôte).
+
+    Si id répond uid=100x(gitlab-runner) et que Podman répond : Vous êtes en mode shell direct sur l'hôte.
+                                                                                                                                         
+                                                                                                                                         
