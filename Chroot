@@ -1,0 +1,79 @@
+--
+sftp-chroot/
+├── playbook.yml
+├── templates/
+│   └── sftp_toto.conf.j2
+└── inventory.ini
+template :
+Match User {{ sftp_user }}
+    ChrootDirectory {{ sftp_chroot_dir }}
+    ForceCommand internal-sftp
+    AllowTcpForwarding no
+    X11Forwarding no
+    PasswordAuthentication yes
+
+Le client devrait atterrir dans / (qui correspond en réalité à /srv/sftp/toto) et pouvoir écrire uniquement dans upload/.
+
+Points d’attention
+
+	•	Toute la chaîne de répertoires jusqu’à ChrootDirectory doit appartenir à root, permissions max 755.
+	•	Si tu utilises des clés SSH, place-les dans /srv/sftp/toto/.ssh/authorized_keys (le .ssh doit aussi appartenir à root si dans le chroot — sinon gère l’authentification par clé via un chemin hors chroot).
+	•	Pour plusieurs clients, un Match Group sftpusers avec ChrootDirectory /srv/sftp/%u est plus scalable qu’un Match User par compte.
+
+Besoin d’aide pour l’authentification par clé ou pour gérer plusieurs comptes en même temps ?
+AuthorizedKeysFile /etc/ssh/authorized_keys/%u
+ssh-keygen -t ed25519 -C "toto@client-machine"
+
+-
+- name: Configuration SFTP chrooté pour toto
+  hosts: sftp_servers
+  become: true
+  vars:
+    sftp_user: toto
+    sftp_chroot_dir: /srv/sftp/toto
+
+  tasks:
+    - name: Créer l'utilisateur sans shell
+      ansible.builtin.user:
+        name: "{{ sftp_user }}"
+        shell: /usr/sbin/nologin
+        create_home: false
+
+    - name: Créer le répertoire racine du chroot (root:root, 755)
+      ansible.builtin.file:
+        path: "{{ sftp_chroot_dir }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+
+    - name: Créer le sous-répertoire d'upload
+      ansible.builtin.file:
+        path: "{{ sftp_chroot_dir }}/upload"
+        state: directory
+        owner: "{{ sftp_user }}"
+        group: "{{ sftp_user }}"
+        mode: "0755"
+
+    - name: S'assurer que le subsystem sftp est en interne
+      ansible.builtin.lineinfile:
+        path: /etc/ssh/sshd_config
+        regexp: '^Subsystem\s+sftp'
+        line: 'Subsystem sftp internal-sftp'
+        state: present
+
+    - name: Déployer le bloc Match pour l'utilisateur
+      ansible.builtin.template:
+        src: templates/sftp_toto.conf.j2
+        dest: /etc/ssh/sshd_config.d/sftp_{{ sftp_user }}.conf
+        owner: root
+        group: root
+        mode: "0644"
+        validate: sshd -t -f %s
+      notify: Redémarrer sshd
+
+  handlers:
+    - name: Redémarrer sshd
+      ansible.builtin.systemd:
+        name: ssh
+        state: restarted
