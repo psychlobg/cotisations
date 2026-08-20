@@ -1,0 +1,13 @@
+disk sanitize release 0a.00.0 0a.00.1 0a.00.2 0a.00.3 0a.00.4 0a.00.5 ...
+
+Après le release, sortez du nodeshell (exit) et faites un storage disk unfail -spare true si certains disques restent en FAILED.
+
+
+Dans le cluster shell ONTAP (si les disques apparaissent encore comme failed ou non-spare) :
+
+set -privilege advanced
+storage disk unfail -disk <disk_name> -spare true
+
+storage disk show
+storage aggregate show-spare-disks
+storage disk set-led -disk <disk_name> -action off
