@@ -1,0 +1,263 @@
+chmod +x dump_config.sh
+./dump_config.sh
+
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+# ------------------------------------------------------------------------------
+# CONFIGURATION
+# ------------------------------------------------------------------------------
+# Chemin vers ta clé privée SSH sur ton poste local
+SSH_KEY="$HOME/.ssh/id_ed25519"
+
+# Liste des serveurs SSH (format: utilisateur@ip_ou_nom)
+SERVERS=(
+    "admin@192.168.1.10"
+    "admin@192.168.1.11"
+)
+
+DIRS_TO_INSPECT=("/etc" "/var/www")
+BINARIES_TO_CHECK=("nginx" "docker" "python3" "curl")
+FILES_TO_FETCH=("/usr/local/bin/backup.sh" "/root/deploy.sh")
+
+# ------------------------------------------------------------------------------
+# EXÉCUTION
+# ------------------------------------------------------------------------------
+# Vérification de l'existence de la clé privée
+if [ ! -f "${SSH_KEY}" ]; then
+    echo "Erreur : La clé SSH '${SSH_KEY}' est introuvable."
+    exit 1
+fi
+
+# Demande du mot de passe sudo pour les exécutions distantes
+read -sp "[?] Entrez le mot de passe sudo pour les serveurs distants : " SUDO_PASS
+echo -e "\n"
+
+TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
+
+for TARGET in "${SERVERS[@]}"; do
+    HOSTNAME_CLEAN=$(echo "${TARGET}" | sed 's/[^a-zA-Z0-9._-]/_/g')
+    DEST_DIR="./dumps/${HOSTNAME_CLEAN}_${TIMESTAMP}"
+
+    mkdir -p "${DEST_DIR}/services_config" "${DEST_DIR}/scripts_recuperes"
+    echo "=== Collecte sur ${TARGET} -> ${DEST_DIR} ==="
+
+    # Fonction pour exécuter sudo à distance avec la clé SSH
+    run_sudo() {
+        echo "${SUDO_PASS}" | ssh -i "${SSH_KEY}" -q -n "${TARGET}" "sudo -S -p '' $1 2>/dev/null" || true
+    }
+
+    # 1. Arborescence et droits
+    echo "[1/5] Listing des dossiers et droits..."
+    {
+        for dir in "${DIRS_TO_INSPECT[@]}"; do
+            echo -e "\n=== Structure et droits pour ${dir} ==="
+            run_sudo "ls -laR '${dir}'"
+        done
+    } > "${DEST_DIR}/dossiers_et_droits.txt"
+
+    # 2. Services
+    echo "[2/5] Extraction des services..."
+    run_sudo "systemctl list-unit-files --type=service" > "${DEST_DIR}/services_config/systemd_services.txt"
+    run_sudo "systemctl status nginx" > "${DEST_DIR}/services_config/nginx_status.txt"
+    run_sudo "nginx -T" > "${DEST_DIR}/services_config/nginx_full_conf.txt"
+
+    # 3. Versions des binaires
+    echo "[3/5] Vérification des versions des binaires..."
+    {
+        for bin in "${BINARIES_TO_CHECK[@]}"; do
+            echo -n "${bin}: "
+            ssh -i "${SSH_KEY}" -n "${TARGET}" "command -v '${bin}' >/dev/null 2>&1 && '${bin}' --version 2>&1 || echo 'Non installé'"
+        done
+    } > "${DEST_DIR}/versions_binaires.txt"
+
+    # 4. Config TC
+    echo "[4/5] Extraction de la config TC pour ens0..."
+    {
+        run_sudo "tc qdisc show dev ens0"
+        run_sudo "tc class show dev ens0"
+        run_sudo "tc filter show dev ens0"
+    } > "${DEST_DIR}/tc_ens0_config.txt"
+
+    # 5. Configuration sshd_config
+    echo "[5/5] Récupération de sshd_config..."
+    run_sudo "cat /etc/ssh/sshd_config" > "${DEST_DIR}/sshd_config"
+
+    # 6. Copie des scripts distants
+    echo "[Bonus] Rapatriement des scripts distants..."
+    for script_path in "${FILES_TO_FETCH[@]}"; do
+        filename=$(basename "${script_path}")
+        run_sudo "cat '${script_path}'" > "${DEST_DIR}/scripts_recuperes/${filename}"
+    done
+
+    echo "Collecte terminée pour ${TARGET} !"
+    echo "----------------------------------------------"
+done
+
+# 6. Copie des scripts distants en conservant l'arborescence
+    echo "[Bonus] Rapatriement des scripts distants (arborescence conservée)..."
+    for script_path in "${FILES_TO_FETCH[@]}"; do
+        # Retire le premier slash pour créer un chemin relatif
+        rel_path="${script_path#/}"
+        # Détermine le dossier de destination local
+        target_dir="${DEST_DIR}/scripts_recuperes/$(dirname "${rel_path}")"
+        
+        # Crée les dossiers locaux nécessaires
+        mkdir -p "${target_dir}"
+        
+        # Récupère le contenu du fichier via sudo cat
+        run_sudo "cat '${script_path}'" > "${DEST_DIR}/scripts_recuperes/${rel_path}"
+    done
+file_suffixed="myscript_$(date +'%Y-%m-%d_%H%M').py"
+
+      
+# ------------------------------------------------------------------------------
+# CONFIGURATION
+# ------------------------------------------------------------------------------
+# Chemin vers ta clé privée SSH sur ton poste Windows
+$SshKey = "$env:USERPROFILE\.ssh\id_ed25519"
+
+# Liste des serveurs SSH (format: utilisateur@ip_ou_nom)
+$Servers = @(
+    "admin@192.168.1.10",
+    "admin@192.168.1.11"
+)
+
+# Liste des dossiers distants à inspecter
+$DirsToInspect = @("/etc", "/var/www")
+
+# Liste des exécutables dont tu veux vérifier la version
+$BinariesToCheck = @("nginx", "docker", "python3", "curl")
+
+# Liste des scripts ou fichiers distants à rapatrier
+$FilesToFetch = @("/usr/local/bin/backup.sh", "/root/deploy.sh")
+
+# ------------------------------------------------------------------------------
+# EXÉCUTION
+# ------------------------------------------------------------------------------
+
+# 1. Vérification de l'existence de la clé SSH
+if (-not (Test-Path $SshKey)) {
+    Write-Error "La clé SSH est introuvable à l'emplacement : $SshKey"
+    exit 1
+}
+
+# 2. Saisie sécurisée du mot de passe sudo pour la session
+$SudoPass = Read-Host "Entrez le mot de passe sudo pour les serveurs distants" -AsSecureString
+$BSTR = [System.Runtime.InteropServices.Marshal]::SecureStringToBSTR($SudoPass)
+$PlainSudoPass = [System.Runtime.InteropServices.Marshal]::PtrToStringAuto($BSTR)
+
+$Timestamp = Get-Date -Format "yyyyMMdd_HHmmss"
+
+# Fonction helper pour exécuter sudo à distance
+function Invoke-SudoSsh {
+    param (
+        [string]$Target,
+        [string]$RemoteCommand
+    )
+    # Transmet le mot de passe sudo via stdin (sudo -S)
+    $PlainSudoPass | ssh -i $SshKey -q -n $Target "sudo -S -p '' $RemoteCommand 2>/dev/null"
+}
+
+foreach ($Target in $Servers) {
+    $CleanHost = $Target -replace '[^a-zA-Z0-9._-]', '_'
+    $DestDir = ".\dumps\${CleanHost}_${Timestamp}"
+
+    $null = New-Item -ItemType Directory -Force -Path "$DestDir\services_config"
+    $null = New-Item -ItemType Directory -Force -Path "$DestDir\scripts_recuperes"
+
+    Write-Host "=== Collecte sur $Target -> $DestDir ===" -ForegroundColor Green
+
+    # 1. Arborescence et droits
+    Write-Host "[1/5] Listing des dossiers et droits..." -ForegroundColor Cyan
+    $FolderOutput = foreach ($Dir in $DirsToInspect) {
+        "`n=== Structure et droits pour $Dir ==="
+        Invoke-SudoSsh -Target $Target -RemoteCommand "ls -laR '$Dir'"
+    }
+    $FolderOutput | Out-File -FilePath "$DestDir\dossiers_et_droits.txt" -Encoding utf8
+
+    # 2. Services
+    Write-Host "[2/5] Extraction des services..." -ForegroundColor Cyan
+    Invoke-SudoSsh -Target $Target -RemoteCommand "systemctl list-unit-files --type=service" | Out-File "$DestDir\services_config\systemd_services.txt" -Encoding utf8
+    Invoke-SudoSsh -Target $Target -RemoteCommand "systemctl status nginx" | Out-File "$DestDir\services_config\nginx_status.txt" -Encoding utf8
+    Invoke-SudoSsh -Target $Target -RemoteCommand "nginx -T" | Out-File "$DestDir\services_config\nginx_full_conf.txt" -Encoding utf8
+
+    # 3. Versions des binaires
+    Write-Host "[3/5] Vérification des versions des binaires..." -ForegroundColor Cyan
+    $BinOutput = foreach ($Bin in $BinariesToCheck) {
+        $Res = ssh -i $SshKey -n $Target "command -v '$Bin' >/dev/null 2>&1 && '$Bin' --version 2>&1 || echo 'Non installé'"
+        "$Bin: $Res"
+    }
+    $BinOutput | Out-File -FilePath "$DestDir\versions_binaires.txt" -Encoding utf8
+
+    # 4. Config TC
+    Write-Host "[4/5] Extraction de la config TC pour ens0..." -ForegroundColor Cyan
+    $TcOutput = @(
+        Invoke-SudoSsh -Target $Target -RemoteCommand "tc qdisc show dev ens0"
+        Invoke-SudoSsh -Target $Target -RemoteCommand "tc class show dev ens0"
+        Invoke-SudoSsh -Target $Target -RemoteCommand "tc filter show dev ens0"
+    )
+    $TcOutput | Out-File -FilePath "$DestDir\tc_ens0_config.txt" -Encoding utf8
+
+    # 5. Configuration sshd_config
+    Write-Host "[5/5] Récupération de sshd_config..." -ForegroundColor Cyan
+    Invoke-SudoSsh -Target $Target -RemoteCommand "cat /etc/ssh/sshd_config" | Out-File "$DestDir\sshd_config" -Encoding utf8
+
+    # 6. Copie des scripts distants
+    Write-Host "[Bonus] Rapatriement des scripts distants..." -ForegroundColor Cyan
+    foreach ($ScriptPath in $FilesToFetch) {
+        $FileName = Split-Path $ScriptPath -Leaf
+        Invoke-SudoSsh -Target $Target -RemoteCommand "cat '$ScriptPath'" | Out-File "$DestDir\scripts_recuperes\$FileName" -Encoding utf8
+    }
+
+    Write-Host "Collecte terminée pour $Target !`n" -ForegroundColor Green
+}
+
+Write-Host "Toutes les extractions sont terminées dans .\dumps\" -ForegroundColor Yellow
+
+# 6. Copie des scripts distants en conservant l'arborescence
+    Write-Host "[Bonus] Rapatriement des scripts distants (arborescence conservée)..." -ForegroundColor Cyan
+    foreach ($ScriptPath in $FilesToFetch) {
+        # Nettoie le chemin pour en faire un chemin relatif Windows (remplace / par \)
+        $RelPath = $ScriptPath.TrimStart('/').Replace('/', '\')
+        $LocalFilePath = Join-Path "$DestDir\scripts_recuperes" $RelPath
+        $LocalDirPath  = Split-Path $LocalFilePath -Parent
+
+        # Crée l'arborescence de dossiers en local
+        if (-not (Test-Path $LocalDirPath)) {
+            $null = New-Item -ItemType Directory -Force -Path $LocalDirPath
+        }
+
+        # Récupère le contenu et l'écrit dans le fichier local
+        Invoke-SudoSsh -Target $Target -RemoteCommand "cat '$ScriptPath'" | Out-File -FilePath $LocalFilePath -Encoding utf8
+    }
+$FileSuffixed = "myscript_$(Get-Date -Format 'yyyy-MM-dd_HHmm').py"
+
+ssh -i ~/.ssh/id_ed25519 admin@192.168.1.10 "sudo tree -pug /etc" > tree_etc_$(date +'%Y-%m-%d_%H%M').txt
+
+Remarque bien l'espace juste avant SUDO_PASS)
+
+Prérequis obligatoire :
+Pour que cette astuce fonctionne, il faut que la variable HISTCONTROL de ton shell contienne ignorespace ou ignoreboth. C'est généralement activé par défaut sur Debian/Ubuntu, mais tu peux le vérifier ou le forcer avec cette commande :
+Bash
+
+export HISTCONTROL=ignorespace
+
+(Si besoin, ajoute cette ligne dans ton file ~/.bashrc pour la rendre permanente).
+
+                                                      Méthode 2 : Masquer la saisie interactiver (read -s)
+
+C'est la méthode la plus sécurisée. La commande ne contient aucun mot de passe en clair, et la saisie à l'écran est totalement masquée (aucun caractère n'apparaît quand tu tapes).
+Bash
+
+read -sp "Mot de passe sudo : " SUDO_PASS
+                                                                                                                                        
+# Saisie masquée du mot de passe (rien dans l'historique)
+read -sp "Mot de passe sudo : " SUDO_PASS
+
+# Envoi de la commande à distance
+echo "$SUDO_PASS" | ssh -i ~/.ssh/id_ed25519 admin@192.168.1.10 "sudo -S -p '' tree -pug /etc 2>/dev/null" > "tree_etc_$(date +'%Y-%m-%d_%H%M').txt"
+                                                      
+                                                      
+                                                      
