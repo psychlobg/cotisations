@@ -1,0 +1,57 @@
+# --- PRÉREQUIS (À LANCEUR UNE FOIS DANS LE TERMINAL) ---
+TARGET="admin@192.168.1.10"
+SSH_KEY="$HOME/.ssh/id_ed25519"
+DEST_DIR="./dumps/$(echo "${TARGET}" | sed 's/[^a-zA-Z0-9._-]/_/g')_$(date +'%Y%m%d_%H%M%S')"
+read -sp "[?] Mot de passe sudo pour ${TARGET} : " SUDO_PASS && echo
+
+# --- COMMANDES UNITAIRES (1 LIGNE = 1 SSH = 1 FICHIER) ---
+
+# 1. Arborescence et droits (/etc)
+mkdir -p "${DEST_DIR}" && echo "${SUDO_PASS}" | ssh -i "${SSH_KEY}" -q -n "${TARGET}" "sudo -S -p '' ls -laR '/etc' 2>/dev/null" > "${DEST_DIR}/droits_etc.txt" || true
+
+# 2. Services systemd
+mkdir -p "${DEST_DIR}/services_config" && echo "${SUDO_PASS}" | ssh -i "${SSH_KEY}" -q -n "${TARGET}" "sudo -S -p '' systemctl list-unit-files --type=service 2>/dev/null" > "${DEST_DIR}/services_config/systemd_services.txt" || true
+
+# 3. Version d'un binaire (nginx)
+mkdir -p "${DEST_DIR}" && ssh -i "${SSH_KEY}" -n "${TARGET}" "command -v nginx >/dev/null 2>&1 && nginx --version 2>&1 || echo 'Non installé'" > "${DEST_DIR}/version_nginx.txt" || true
+
+# 4. Configuration TC de l'interface ens0
+mkdir -p "${DEST_DIR}" && echo "${SUDO_PASS}" | ssh -i "${SSH_KEY}" -q -n "${TARGET}" "sudo -S -p '' tc qdisc show dev ens0 2>/dev/null; sudo -S -p '' tc class show dev ens0 2>/dev/null; sudo -S -p '' tc filter show dev ens0 2>/dev/null" > "${DEST_DIR}/tc_ens0_config.txt" || true
+
+# 5. Fichier sshd_config
+mkdir -p "${DEST_DIR}" && echo "${SUDO_PASS}" | ssh -i "${SSH_KEY}" -q -n "${TARGET}" "sudo -S -p '' cat /etc/ssh/sshd_config 2>/dev/null" > "${DEST_DIR}/sshd_config" || true
+
+# 6. Rapatriement d'un script en conservant l'arborescence (/usr/local/bin/backup.sh)
+mkdir -p "${DEST_DIR}/scripts_recuperes/usr/local/bin" && echo "${SUDO_PASS}" | ssh -i "${SSH_KEY}" -q -n "${TARGET}" "sudo -S -p '' cat '/usr/local/bin/backup.sh' 2>/dev/null" > "${DEST_DIR}/scripts_recuperes/usr/local/bin/backup.sh" || true
+
+
+# --- PRÉREQUIS (À LANCER UNE FOIS DANS LE TERMINAL POWERSHELL) ---
+$Target = "admin@192.168.1.10"
+$SshKey = "$env:USERPROFILE\.ssh\id_ed25519"
+$CleanTarget = $Target -replace '[^a-zA-Z0-9._-]', '_'
+$Timestamp = Get-Date -Format "yyyyMMdd_HHmmss"
+$DestDir = ".\dumps\${CleanTarget}_${Timestamp}"
+
+$SudoPass = Read-Host "Mot de passe sudo pour $Target" -AsSecureString
+$BSTR = [System.Runtime.InteropServices.Marshal]::SecureStringToBSTR($SudoPass)
+$PlainPass = [System.Runtime.InteropServices.Marshal]::PtrToStringAuto($BSTR)
+
+# --- COMMANDES UNITAIRES (1 LIGNE = 1 SSH = 1 FICHIER) ---
+
+# 1. Arborescence et droits (/etc)
+if (-not (Test-Path "$DestDir")) { $null = New-Item -ItemType Directory -Force -Path "$DestDir" }; $PlainPass | ssh -i $SshKey -q -n $Target "sudo -S -p '' ls -laR '/etc' 2>/dev/null" | Out-File -FilePath "$DestDir\droits_etc.txt" -Encoding utf8
+
+# 2. Services systemd
+if (-not (Test-Path "$DestDir\services_config")) { $null = New-Item -ItemType Directory -Force -Path "$DestDir\services_config" }; $PlainPass | ssh -i $SshKey -q -n $Target "sudo -S -p '' systemctl list-unit-files --type=service 2>/dev/null" | Out-File -FilePath "$DestDir\services_config\systemd_services.txt" -Encoding utf8
+
+# 3. Version d'un binaire (nginx)
+if (-not (Test-Path "$DestDir")) { $null = New-Item -ItemType Directory -Force -Path "$DestDir" }; ssh -i $SshKey -n $Target "command -v nginx >/dev/null 2>&1 && nginx --version 2>&1 || echo 'Non installé'" | Out-File -FilePath "$DestDir\version_nginx.txt" -Encoding utf8
+
+# 4. Configuration TC de l'interface ens0
+if (-not (Test-Path "$DestDir")) { $null = New-Item -ItemType Directory -Force -Path "$DestDir" }; $PlainPass | ssh -i $SshKey -q -n $Target "sudo -S -p '' tc qdisc show dev ens0 2>/dev/null; sudo -S -p '' tc class show dev ens0 2>/dev/null; sudo -S -p '' tc filter show dev ens0 2>/dev/null" | Out-File -FilePath "$DestDir\tc_ens0_config.txt" -Encoding utf8
+
+# 5. Fichier sshd_config
+if (-not (Test-Path "$DestDir")) { $null = New-Item -ItemType Directory -Force -Path "$DestDir" }; $PlainPass | ssh -i $SshKey -q -n $Target "sudo -S -p '' cat /etc/ssh/sshd_config 2>/dev/null" | Out-File -FilePath "$DestDir\sshd_config" -Encoding utf8
+
+# 6. Rapatriement d'un script en conservant l'arborescence (/usr/local/bin/backup.sh)
+if (-not (Test-Path "$DestDir\scripts_recuperes\usr\local\bin")) { $null = New-Item -ItemType Directory -Force -Path "$DestDir\scripts_recuperes\usr\local\bin" }; $PlainPass | ssh -i $SshKey -q -n $Target "sudo -S -p '' cat '/usr/local/bin/backup.sh' 2>/dev/null" | Out-File -FilePath "$DestDir\scripts_recuperes\usr\local\bin\backup.sh" -Encoding utf8
