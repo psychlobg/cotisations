@@ -1,0 +1,46 @@
+Auto-cancel redundant pipelines (Settings → CI/CD → General pipelines,
+: chaque nouveau push annule automatiquement le pipeline en cours de la même branche. Ça réduit directement le volume à la source, gratuit, aucune contrainte de tier.
+Au niveau projet pas configurable sur l'instance
+
+3. Rate limiting sur la création de pipelines
+
+Admin → Settings → Network → Pipelines Rate Limits (désactivé par défaut, dispo Free+) :
+
+Max requests/min par projet+commit+user : bloque le spam de retrigger sur un même commit
+Max requests/min par user : plafonne le total tous projets confondus pour un utilisateur qui pousserait en boucle
+
+2. Limites d'instance (plafonds durs par projet)
+
+Configurable en Admin Area → Settings → CI/CD → Continuous Integration and Deployment, section "Instance limits" :
+
+Maximum number of active pipelines per project — plafonne le nombre de pipelines simultanés qu'un projet peut avoir. Au-delà, les nouveaux pipelines sont rejetés (le prochain commit ne déclenche rien tant qu'il n'y a pas de place).
+Maximum jobs in active pipelines (ci_active_jobs) — plafond global côté plan, réglable en Rails console :
+ruby
+  Plan.default.actual_limits.update!(ci_active_jobs: 500)
+
+1. La fair usage queue (déjà activée par défaut)
+
+Les runners d'instance ("shared runners") n'utilisent pas un FIFO classique. L'algorithme priorise les jobs des projets ayant le moins de jobs déjà en cours sur les runners :
+
+Job d'un projet qui n'a rien en cours → prioritaire
+Un projet qui balance 50 jobs voit ses jobs suivants relégués en fin de file dès que 1-2 tournent déjà
+
+workflow:
+  auto_cancel:
+    on_new_commit: interruptible
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH == "main"
+    - when: never
+
+workflow:
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"   # règle 1
+    - if: $CI_COMMIT_BRANCH == "main"                     # règle 2
+    - when: never                                          # règle 3 (fallback)
+C'est exactement le comportement "temporisation automatique" que tu cherches
+
+2. Marquer le runner comme "Protected"
+
+Admin Area → CI/CD → Runners (ou au niveau projet/groupe) → éditer le runner → cocher Protected
+Effet : ce runner n'accepte que les jobs dont la ref est protégée. Un push sur une branche non protégée reste en pending indéfiniment sur ce runner (aucune autre ref n'a le droit de l'utiliser).
