@@ -1,0 +1,16 @@
+Découpage estimé
+
+Étape	Durée typique
+Sauvegarde (gitlab-backup create)	5–20 min (S3 exclut normalement artefacts/registry du dump → sauvegarde plus rapide, limitée à la base + repos Git + configs)
+Upgrade 18.11.2 → 18.11.11 (patch, peu de migrations lourdes)	5–10 min
+Upgrade 18.11.11 → 19.0.8 (saut majeur, migrations DB plus conséquentes)	15–30 min
+Upgrade 19.0.8 → 19.3.1 (3 minor versions)	15–30 min
+Vérifications post-upgrade + tests fonctionnels	10–15 min
+Total indisponibilité effective	~50 min à 1h45
+
+Ce qui peut faire varier fortement ce chiffre
+
+	•	Migrations en arrière-plan bloquantes : à 500 projets, ça reste un volume modeste (pas d’instance massive), donc les migrations post-deploy ne devraient pas être un facteur limitant majeur. Mais certaines migrations synchrones (bloquant le gitlab-ctl reconfigure) peuvent ralentir un saut majeur comme 18→19.
+	•	Taille de la base PostgreSQL (nombre de MRs, pipelines CI historiques, issues) — c’est souvent le vrai facteur, pas le nombre de projets.
+	•	Type d’instance : VM classique avec disque local rapide (SSD/NVMe) vs stockage réseau plus lent.
+	•	Reconfigure Omnibus : chaque appel à gitlab-ctl reconfigure prend généralement 1–3 min, mais peut grimper si Puma/Sidekiq redémarrent lentement.
