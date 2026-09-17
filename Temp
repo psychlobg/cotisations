@@ -108,3 +108,37 @@ Vérifie les options de timeout/retry dans named.conf :confoptions {
     // valeurs par défaut assez raisonnables
     // tu peux baisser un peu si besoin
 };
+Get-WinEvent -FilterHashtable @{
+    LogName = 'Security'
+    ID = 5152,5156,5157,5158,5159
+} -MaxEvents 20000 -ErrorAction SilentlyContinue | 
+Where-Object { $_.Message -match '25\.25\.25\.25' } | 
+Select-Object TimeCreated, Id, Message | 
+Export-Csv -Path "C:\Temp\events_25.25.25.25.csv" -NoTypeInformation -Encoding UTF8
+
+Get-WinEvent -ListLog * -ErrorAction SilentlyContinue | 
+Where-Object { $_.RecordCount -gt 0 } | 
+ForEach-Object {
+    Get-WinEvent -LogName $_.LogName -MaxEvents 2000 -ErrorAction SilentlyContinue | 
+    Where-Object { $_.Message -match '25\.25\.25\.25' }
+} | Select-Object TimeCreated, LogName, Id, Message | 
+Format-Table -AutoSize
+
+Get-WinEvent -FilterHashtable @{
+    LogName = 'Security'
+    ID = 5152,5156,5157
+} -MaxEvents 10000 -ErrorAction SilentlyContinue | 
+Where-Object { $_.Message -match '25\.25\.25\.25' } | 
+ForEach-Object {
+    [PSCustomObject]@{
+        Time        = $_.TimeCreated
+        EventID     = $_.Id
+        Direction   = if ($_.Message -match 'Direction:\s+(\w+)') { $Matches[1] } else { '' }
+        SourceIP    = if ($_.Message -match 'Source Address:\s+([\d\.]+)') { $Matches[1] } else { '' }
+        DestIP      = if ($_.Message -match 'Destination Address:\s+([\d\.]+)') { $Matches[1] } else { '' }
+        SourcePort  = if ($_.Message -match 'Source Port:\s+(\d+)') { $Matches[1] } else { '' }
+        DestPort    = if ($_.Message -match 'Destination Port:\s+(\d+)') { $Matches[1] } else { '' }
+        Protocol    = if ($_.Message -match 'Protocol:\s+(\d+)') { $Matches[1] } else { '' }
+        FilterID    = if ($_.Message -match 'Filter Run-Time ID:\s+(\d+)') { $Matches[1] } else { '' }
+    }
+} | Format-Table -AutoSize
