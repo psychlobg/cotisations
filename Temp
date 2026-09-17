@@ -1,0 +1,10 @@
+- name: Exemple de tâche
+  mon_module:          # ou command / shell / etc.
+    ...
+  register: resultat
+  failed_when:
+    - resultat.failed
+    - "'already exist' not in resultat.msg | default('')"
+    # ou selon le module :
+    # - "'already exist' not in resultat.stderr | default('')"
+    # - "'already exist' not in resultat.stdout | default('')"
