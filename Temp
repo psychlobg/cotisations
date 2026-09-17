@@ -8,3 +8,103 @@
     # ou selon le module :
     # - "'already exist' not in resultat.stderr | default('')"
     # - "'already exist' not in resultat.stdout | default('')"
+
+# Règles inbound pour DNS et LDAP
+Get-NetFirewallRule -Direction Inbound -Enabled True | 
+  Where-Object { $_.DisplayName -match "DNS|LDAP|Domain Controller|Active Directory" } |
+  Get-NetFirewallAddressFilter | 
+  Select-Object -Property @{n='Rule';e={(Get-NetFirewallRule -AssociatedNetFirewallAddressFilter $_).DisplayName}}, 
+                          RemoteAddress, LocalAddress | 
+  Format-Table -AutoSize
+
+Get-NetFirewallRule -Direction Inbound -Enabled True | 
+  Where-Object { $_.DisplayName -match "DNS|LDAP|Domain Controller" } | 
+  Format-Table DisplayName, Profile, 
+    @{n='RemoteAddress';e={(Get-NetFirewallAddressFilter -AssociatedNetFirewallRule $_).RemoteAddress}} -AutoSize
+
+Regarde bien la colonne RemoteAddress :
+
+Si tu vois LocalSubnet, Any, ou des plages précises → c’est là que se trouve la différence.
+Très souvent on trouve des règles qui autorisent uniquement les anciens sous-réseaux historiques, et pas les nouveaux.
+
+nltest /DSADDRESSTOSITE:IP_DU_SERVEUR_LINUX
+
+
+# Toutes les règles Block inbound activées
+Get-NetFirewallRule -Direction Inbound -Action Block -Enabled True | 
+  Select-Object DisplayName, Profile, 
+    @{n='Protocol';e={(Get-NetFirewallPortFilter -AssociatedNetFirewallRule $_).Protocol}},
+    @{n='LocalPort';e={(Get-NetFirewallPortFilter -AssociatedNetFirewallRule $_).LocalPort}},
+    @{n='RemoteAddress';e={(Get-NetFirewallAddressFilter -AssociatedNetFirewallRule $_).RemoteAddress}} |
+  Format-Table -AutoSize
+
+Get-NetFirewallRule -Direction Inbound -Action Block -Enabled True | 
+  Where-Object {
+    $ports = (Get-NetFirewallPortFilter -AssociatedNetFirewallRule $_).LocalPort
+    $ports -contains 53 -or $ports -contains 636 -or $ports -eq "Any"
+  } | 
+  Format-Table DisplayName, Profile, 
+    @{n='LocalPort';e={(Get-NetFirewallPortFilter -AssociatedNetFirewallRule $_).LocalPort}},
+    @{n='RemoteAddress';e={(Get-NetFirewallAddressFilter -AssociatedNetFirewallRule $_).RemoteAddress}} -AutoSize
+
+2. Pourquoi tu vois « any/any » dans la GUI mais ça bloque quand même ?
+Plusieurs possibilités très fréquentes :
+
+La règle any/any que tu vois n’est pas active sur le profil de l’interface (Domain vs Private/Public).
+Il existe une règle Block plus prioritaire (ou une règle avec un poids plus élevé dans WFP).
+La règle any/any est une règle locale et une GPO a AllowLocalPolicyMerge = No → elle est ignorée.
+La règle any/any est liée à un programme spécifique (ex: dns.exe ou lsass.exe) et pas au trafic générique.
+Il y a plusieurs règles avec le même nom / groupe et seule une partie s’applique.
+
+A. Voir exactement quelles règles matchent un port donné :
+PowerShell# Pour le port 636 (LDAPS)
+Get-NetFirewallPortFilter | Where-Object { $_.LocalPort -eq 636 -or $_.LocalPort -eq "Any" } | 
+  Get-NetFirewallRule | 
+  Where-Object { $_.Direction -eq "Inbound" -and $_.Enabled -eq $true } |
+  Select-Object DisplayName, Action, Profile, 
+    @{n='RemoteAddress';e={(Get-NetFirewallAddressFilter -AssociatedNetFirewallRule $_).RemoteAddress}} |
+  Format-Table -AutoSize
+
+
+Comment vérifier
+PowerShell# Voir la valeur actuelle du merge
+Get-NetFirewallProfile | Select-Object Name, AllowLocalFirewallRules
+Ou via registre / gpresult :
+cmdgpresult /h c:\temp\gp.html
+Puis cherche AllowLocalPolicyMerge ou « Apply local firewall rules ».
+
+En résumé :
+
+Quand AllowLocalPolicyMerge = No, les règles que tu vois dans l’interface graphique locale n’ont aucun effet. Seules les règles venues de la GPO comptent.
+
+Dans BIND, quand tu déclares le domaine AD (ex: ad.domaine.local) avec des NS pointant vers les Domain Controllers, ou via une zone de type forward / stub / static-stub, voici ce qui se passe :
+
+Un client Linux interroge ton serveur BIND pour un nom dans le domaine AD.
+BIND regarde ses NS (ou ses forwarders) pour ce domaine.
+Il envoie la requête aux DC (port 53).
+Si un DC ne répond pas (parce que le firewall le bloque), BIND :
+Passe au NS suivant (s’il y en a plusieurs)
+Applique ses timers de retry (retry, timeout, etc.)
+Peut marquer le serveur comme « lame » ou « unreachable » temporairement
+Peut générer des retries (généralement 2 à 4 tentatives par serveur selon la config)
+
+BIND ne fait pas de flood permanent. Il respecte ses timers.
+
+Cependant, si beaucoup de clients Linux interrogent en même temps des noms AD pendant que les DC sont injoignables, tu peux observer :
+
+Une hausse notable des requêtes sortantes de BIND vers les DC
+Des logs BIND avec beaucoup de lame server, timeout, connection refused ou servfail
+Une latence plus élevée pour les clients Linux (ils attendent la réponse de BIND)
+
+Impact concret sur tes clients Linux
+
+Les requêtes purement internes à BIND (zones non-AD) → pas impactées.
+Les requêtes vers le domaine AD → impactées (ralenties ou en erreur) tant que BIND n’arrive pas à joindre au moins un DC.
+
+Recommandations rapides
+
+Dans BIND, déclare plusieurs NS (idéalement tous les DC) pour le domaine AD.
+Vérifie les options de timeout/retry dans named.conf :confoptions {
+    // valeurs par défaut assez raisonnables
+    // tu peux baisser un peu si besoin
+};
