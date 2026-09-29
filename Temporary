@@ -1,3 +1,20 @@
-Bravo pour cette mutation bien méritée ! Merci pour tout ce qu'on a partagé au quotidien. Je te souhaite le meilleur pour la suite de ton parcours au sein du groupe !
-Un grand merci pour ton aide, tes conseils et ta bonne humeur au quotidien !
-conseils
+priv set advanced
+aggr wafliron start <nom_aggr>
+status -s
+
+Debian n’active pas de cache DNS par défaut.
+Le système interroge directement les serveurs DNS configurés (souvent ceux du routeur ou du FAI) à chaque requête. C’est pour ça que tu peux avoir l’impression que la résolution est lente ou instable. Le cache doit être activé localement sur ta machine.
+
+# 1. Installation
+sudo apt update
+sudo apt install systemd-resolved
+
+# 2. Activation
+sudo systemctl enable --now systemd-resolved
+
+# 3. Pointage de resolv.conf vers le résolveur local
+sudo ln -sf /run/systemd/resolve/resolv.conf /etc/resolv.conf
+
+resolvectl status
+resolvectl statistics   # pour voir le cache
+
