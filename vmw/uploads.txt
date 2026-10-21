@@ -1,0 +1,14 @@
+Si gci vmfs:/DC ne renvoie rien pour ce compte, c’est presque toujours un problème de visibilité des objets : le provider PowerCLI ne liste que les objets sur lesquels l’utilisateur a une permission. Il n’a donc pas besoin d’un privilège supplémentaire sur “DC”, mais de permissions aux bons endroits.
+Permissions à poser
+
+    Sur l’objet datastore (pas seulement sur un dossier sans propagation) : le rôle avec Datastore.Browse datastore, Datastore.Low level file operations et Datastore.Update virtual machine files. Sans permission sur le datastore, celui-ci n’apparaît pas dans la liste.
+    Sur le datacenter “DC” : le rôle prédéfini Read-only, avec Propagate to children décoché. Cela permet de traverser le chemin sans rien ouvrir d’autre. Si le datastore est dans un dossier de datastores, faites la même chose sur ce dossier.
+
+Vérifiez ensuite avec Get-VIPermission -Entity (Get-Datastore NomDuDatastore) que la permission est bien attribuée au groupe, et que l’utilisateur en est bien membre (le groupe AD n’est pas toujours résolu comme on le pense).
+Point d’attention
+
+Il est possible que le problème initial (droit System.* sur l’hôte) revienne au moment du transfert, même une fois le datastore visible. Copy-DatastoreItem et le datastore browser passent par le même mécanisme de transfert de fichiers via vCenter vers l’hôte. Je ne peux pas vous le garantir, mais si c’est le cas, vous saurez que les permissions de visibilité n’étaient pas la cause.
+
+Dans ce cas, la Content Library reste la solution qui contourne le problème, et elle est scriptable : New-ContentLibraryItem -ContentLibrary <lib> -Name <nom> -Files <chemin_iso>. Vous pourriez même proposer un petit script aux utilisateurs.
+
+Pouvez-vous me donner le message d’erreur exact de Copy-DatastoreItem, une fois le datastore visible ? Cela permettra de savoir si on est face à un problème de visibilité ou au même blocage côté hôte.
